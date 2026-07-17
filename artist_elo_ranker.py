@@ -26,10 +26,12 @@ from novelai_python.sdk.ai.generate_image import Model, Sampler, UCPreset
 from config import (
     get_api_key,
     ARTIST_TAGS_FILE,
+    DATA_DIR,
     ELO_RATINGS_FILE,
     COMPARISON_IMAGES_DIR,
     COMPARISON_HISTORY_FILE,
     ACTIVE_POOL_FILE,
+    CURRENT_COMPARISON_FILE,
     STEPS,
     IMG_WIDTH,
     IMG_HEIGHT,
@@ -40,6 +42,9 @@ from config import (
     LOSER_ROTATION_PROBABILITY,
     SERVER_HOST,
     SERVER_PORT,
+    APP_USERNAME,
+    APP_PASSWORD,
+    INBROWSER,
     NEGATIVE_PROMPT,
     DEFAULT_PROMPT,
 )
@@ -51,6 +56,130 @@ from config import (
 MODEL = Model.NAI_DIFFUSION_4_5_FULL
 SAMPLER = Sampler.K_EULER_ANCESTRAL
 UC_PRESET = UCPreset.TYPE0
+
+
+# --------------------------------------------------------------------------------
+# Mobile-first UI
+# --------------------------------------------------------------------------------
+
+APP_HEAD = """
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111827">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Artist ELO">
+"""
+
+MOBILE_CSS = """
+.gradio-container {
+    max-width: 1320px !important;
+    margin: 0 auto !important;
+    padding-bottom: calc(7rem + env(safe-area-inset-bottom)) !important;
+}
+
+#app-header h1 {
+    margin-bottom: .25rem;
+    letter-spacing: -.03em;
+}
+
+#app-header p {
+    margin-top: 0;
+    color: var(--body-text-color-subdued);
+}
+
+#status-card {
+    border: 1px solid var(--border-color-primary);
+    border-radius: 14px;
+    padding: .7rem 1rem;
+    background: var(--background-fill-secondary);
+}
+
+#comparison-row {
+    gap: 1rem;
+}
+
+.image-card {
+    min-width: 0 !important;
+    border: 1px solid var(--border-color-primary);
+    border-radius: 18px;
+    padding: .65rem;
+    background: var(--block-background-fill);
+    box-shadow: var(--block-shadow);
+}
+
+.comparison-image img {
+    width: 100% !important;
+    height: auto !important;
+    aspect-ratio: 1 / 1;
+    object-fit: contain !important;
+    border-radius: 12px;
+}
+
+#vote-dock {
+    position: sticky;
+    bottom: max(.5rem, env(safe-area-inset-bottom));
+    z-index: 20;
+    gap: .6rem;
+    margin-top: .75rem;
+    padding: .7rem;
+    border: 1px solid var(--border-color-primary);
+    border-radius: 18px;
+    background: color-mix(in srgb, var(--background-fill-primary) 92%, transparent);
+    backdrop-filter: blur(14px);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, .18);
+}
+
+#vote-a, #vote-b {
+    min-height: 54px;
+    font-size: 1rem;
+    font-weight: 750;
+}
+
+#secondary-actions button {
+    min-height: 46px;
+}
+
+@media (max-width: 760px) {
+    .gradio-container {
+        padding: .7rem .7rem calc(6.5rem + env(safe-area-inset-bottom)) !important;
+    }
+
+    #app-header h1 {
+        font-size: 1.55rem;
+    }
+
+    #desktop-help {
+        display: none;
+    }
+
+    #main-layout,
+    #comparison-row {
+        flex-direction: column !important;
+    }
+
+    #main-layout > div,
+    #comparison-row > div {
+        width: 100% !important;
+        min-width: 0 !important;
+    }
+
+    .image-card {
+        padding: .45rem;
+        border-radius: 14px;
+    }
+
+    #vote-dock {
+        margin-left: -.25rem;
+        margin-right: -.25rem;
+        padding: .55rem;
+        border-radius: 16px;
+    }
+
+    #vote-dock button {
+        min-width: 0 !important;
+    }
+}
+"""
 
 
 # --------------------------------------------------------------------------------
@@ -843,6 +972,11 @@ class ArtistELORanker:
     """Main application class."""
 
     def __init__(self):
+        # DATA_DIR may point to a newly mounted cloud disk, so create it before
+        # any of the JSON-backed managers attempt to save their initial state.
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        COMPARISON_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
         self.elo_system = ELOSystem.load(ELO_RATINGS_FILE)
         self.artist_manager = ArtistTagManager(ARTIST_TAGS_FILE)
         # Initialize the active pool with ELO system
@@ -856,6 +990,10 @@ class ArtistELORanker:
         self.current_artists_a: List[str] = []
         self.current_artists_b: List[str] = []
         self.current_prompt: str = DEFAULT_PROMPT
+        self.current_custom_prompt: str = ""
+        self.current_negative_prompt: str = ""
+        self.current_quality_toggle: bool = True
+        self.current_uc_preset: int = 0
 
         # Undo state
         self.last_undo_state: Optional[UndoState] = None
@@ -865,8 +1003,80 @@ class ArtistELORanker:
         # type: "out" or "in", extra_info: is_returning for "in"
         self.rotation_log: List[Tuple[str, str, float, Optional[bool]]] = []
 
-        # Ensure output directory exists
-        COMPARISON_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        # Reuse the last unexpired pair after a mobile page refresh or server
+        # restart. This avoids an accidental extra NovelAI generation charge.
+        self.load_current_comparison()
+
+    @staticmethod
+    def _load_image_path(value: str) -> Optional[Path]:
+        """Return a saved comparison image path only when it is still safe and valid."""
+        if not value:
+            return None
+
+        try:
+            path = Path(value).expanduser().resolve()
+            image_dir = COMPARISON_IMAGES_DIR.resolve()
+        except (OSError, RuntimeError):
+            return None
+
+        if image_dir not in path.parents or not path.is_file():
+            return None
+        return path
+
+    def load_current_comparison(self):
+        """Restore the latest comparison so refreshing the phone does not regenerate it."""
+        if not CURRENT_COMPARISON_FILE.exists():
+            return
+
+        try:
+            with open(CURRENT_COMPARISON_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            image_a = self._load_image_path(data.get("image_a", ""))
+            image_b = self._load_image_path(data.get("image_b", ""))
+            artists_a = data.get("artists_a", [])
+            artists_b = data.get("artists_b", [])
+
+            if not image_a or not image_b or not artists_a or not artists_b:
+                return
+
+            self.current_image_a = image_a
+            self.current_image_b = image_b
+            self.current_artists_a = [str(a) for a in artists_a]
+            self.current_artists_b = [str(a) for a in artists_b]
+            self.current_prompt = str(data.get("processed_prompt", DEFAULT_PROMPT))
+            self.current_custom_prompt = str(data.get("custom_prompt", ""))
+            self.current_negative_prompt = str(data.get("negative_prompt", ""))
+            self.current_quality_toggle = bool(data.get("quality_toggle", True))
+            self.current_uc_preset = int(data.get("uc_preset", 0))
+            self.selection_made = bool(data.get("selection_made", False))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            print(f"Could not restore current comparison: {exc}")
+
+    def save_current_comparison(self):
+        """Persist the current pair and form settings atomically."""
+        if not self.current_image_a or not self.current_image_b:
+            return
+
+        data = {
+            "image_a": str(self.current_image_a),
+            "image_b": str(self.current_image_b),
+            "artists_a": self.current_artists_a,
+            "artists_b": self.current_artists_b,
+            "processed_prompt": self.current_prompt,
+            "custom_prompt": self.current_custom_prompt,
+            "negative_prompt": self.current_negative_prompt,
+            "quality_toggle": self.current_quality_toggle,
+            "uc_preset": self.current_uc_preset,
+            "selection_made": self.selection_made,
+        }
+        temp_file = CURRENT_COMPARISON_FILE.with_suffix(".tmp")
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            temp_file.replace(CURRENT_COMPARISON_FILE)
+        except OSError as exc:
+            print(f"Could not save current comparison: {exc}")
 
     def get_session(self) -> ApiCredential:
         """Get or create API session."""
@@ -910,9 +1120,9 @@ class ArtistELORanker:
     def format_recent_history(self, limit: int = 10) -> str:
         """Format recent comparison history for display."""
         if not self.history.records:
-            return "*No comparisons yet.*"
+            return "*아직 비교 기록이 없습니다.*"
 
-        lines = ["*Newest first:*", ""]
+        lines = ["*최신순:*", ""]
         recent = self.history.records[-limit:][::-1]  # Last N, reversed (newest first)
 
         for i, record in enumerate(recent, 1):
@@ -926,7 +1136,7 @@ class ArtistELORanker:
             winner_str = ", ".join(winner_artists)
             loser_str = ", ".join(loser_artists)
 
-            lines.append(f"{i}. **{winner_str}** beat {loser_str}")
+            lines.append(f"{i}. **{winner_str}** 승 · {loser_str} 패")
 
         return "\n".join(lines)
 
@@ -936,10 +1146,10 @@ class ArtistELORanker:
         pool_stats = self.artist_manager.get_pool_stats()
         artist_stats = self.history.get_artist_stats()
 
-        lines = ["## Top Artists", ""]
+        lines = ["## 작가 랭킹", ""]
 
         if not top_artists:
-            lines.append("No ratings yet. Start comparing!")
+            lines.append("아직 랭킹이 없습니다. 첫 비교를 시작하세요.")
         else:
             # Use markdown list format with win rate stats
             for i, (artist, rating, comparisons) in enumerate(top_artists, 1):
@@ -974,26 +1184,26 @@ class ArtistELORanker:
         lines.append("")
         lines.append("---")
         lines.append("")
-        lines.append(f"**Comparisons:** {self.elo_system.comparison_count}  ")
-        lines.append(f"**Artists rated:** {len(self.elo_system.ratings)}  ")
-        lines.append(f"**Pool:** {pool_stats.get('size', 0)}/{pool_stats.get('total_artists', 0)}")
+        lines.append(f"**전체 비교:** {self.elo_system.comparison_count}  ")
+        lines.append(f"**평가한 작가:** {len(self.elo_system.ratings)}  ")
+        lines.append(f"**활성 풀:** {pool_stats.get('size', 0)}/{pool_stats.get('total_artists', 0)}")
 
         # Pool health breakdown
         lines.append("")
         lines.append("---")
-        lines.append("### Pool Health")
+        lines.append("### 활성 풀 상태")
         safe = pool_stats.get('safe', 0)
         newcomers = pool_stats.get('newcomers', 0)
         at_risk_count = pool_stats.get('at_risk_count', 0)
-        lines.append(f"Above avg: {safe}  ")
-        lines.append(f"Newcomers (<5 matches): {newcomers}  ")
-        lines.append(f"Below avg: {at_risk_count}")
+        lines.append(f"평균 이상: {safe}  ")
+        lines.append(f"신규 (<5회): {newcomers}  ")
+        lines.append(f"평균 미만: {at_risk_count}")
 
         # Show top at-risk artists
         at_risk = pool_stats.get('at_risk', [])
         if at_risk:
             lines.append("")
-            lines.append("**Most likely to rotate out:**")
+            lines.append("**교체 가능성이 높은 작가:**")
             for artist, elo, matches, weight in at_risk[:5]:
                 lines.append(f"- {artist} ({elo:.0f})")
 
@@ -1001,8 +1211,8 @@ class ArtistELORanker:
         if self.rotation_log:
             lines.append("")
             lines.append("---")
-            lines.append("### Pool Changes")
-            lines.append("*Newest first:*")
+            lines.append("### 최근 풀 변경")
+            lines.append("*최신순:*")
             for rot_type, artist, elo, extra in self.rotation_log[:8]:
                 if rot_type == "in":
                     status = "[returning]" if extra else "[new]"
@@ -1014,6 +1224,9 @@ class ArtistELORanker:
 
     async def generate_new_comparison(self, custom_prompt: str, custom_negative_prompt: str = "", quality_toggle: bool = True, uc_preset: int = 0):
         """Generate a new pair of images for comparison."""
+        custom_prompt = custom_prompt or ""
+        custom_negative_prompt = custom_negative_prompt or ""
+
         # Use custom prompt if provided, otherwise default
         base_prompt = custom_prompt.strip() if custom_prompt.strip() else DEFAULT_PROMPT
 
@@ -1029,18 +1242,19 @@ class ArtistELORanker:
             base_prompt = insert_artist_tags(base_prompt, "{artist_placeholder}")
 
         self.current_prompt = base_prompt
+        self.current_custom_prompt = custom_prompt
+        self.current_negative_prompt = custom_negative_prompt
+        self.current_quality_toggle = bool(quality_toggle)
+        self.current_uc_preset = int(uc_preset)
 
         try:
             session = self.get_session()
         except ValueError as e:
             # API key not configured
             error_msg = (
-                "**API Key Not Configured**\n\n"
-                "Please set up your NovelAI API key:\n\n"
-                "1. Copy `.env.example` to `.env`\n"
-                "2. Add your API key: `NOVELAI_API_KEY=pst-your-key-here`\n"
-                "3. Restart the application\n\n"
-                "Get your API key from [NovelAI](https://novelai.net/) → Account Settings → Get Persistent API Token"
+                "**NovelAI API 키가 설정되지 않았습니다.**\n\n"
+                "배포 서비스의 비밀 환경변수에 `NOVELAI_API_KEY`를 등록한 뒤 "
+                "앱을 다시 시작하세요. 토큰을 프롬프트나 채팅에 붙여 넣지 마세요."
             )
             return (
                 None,
@@ -1074,6 +1288,7 @@ class ArtistELORanker:
             # BUT keep undo state so user can still undo the previous selection!
             self.selection_made = False
             # Don't clear last_undo_state here - it persists until next selection
+            self.save_current_comparison()
 
             # Undo is available if we have a previous state to restore
             can_undo = self.last_undo_state is not None
@@ -1081,7 +1296,7 @@ class ArtistELORanker:
             return (
                 str(path_a),
                 str(path_b),
-                "Images generated! Pick your preferred image.",
+                "이미지가 생성되었습니다. 더 마음에 드는 쪽을 선택하세요.",
                 self.format_top_artists_display(),
                 "",  # Clear result_msg
                 "",  # Clear details_msg
@@ -1093,7 +1308,7 @@ class ArtistELORanker:
             return (
                 None,
                 None,
-                "Error generating images. Please try again.",
+                "이미지 생성에 실패했습니다. 잠시 후 건너뛰기를 눌러 다시 시도하세요.",
                 self.format_top_artists_display(),
                 "",
                 "",
@@ -1106,7 +1321,7 @@ class ArtistELORanker:
         """Process a winner selection. Returns tuple for UI update."""
         if not self.current_artists_a or not self.current_artists_b:
             return (
-                "No active comparison. Generate new images first.",
+                "진행 중인 비교가 없습니다. 먼저 이미지를 생성하세요.",
                 "",
                 self.format_top_artists_display(),
                 gr.update(interactive=True),  # pick_a
@@ -1116,7 +1331,7 @@ class ArtistELORanker:
 
         if self.selection_made:
             return (
-                "Already made a selection. Undo or generate new images.",
+                "이미 선택한 비교입니다. 되돌리거나 다음 이미지를 생성하세요.",
                 "",
                 self.format_top_artists_display(),
                 gr.update(interactive=False),
@@ -1165,6 +1380,7 @@ class ArtistELORanker:
             prev_artists_b=self.current_artists_b.copy(),
         )
         self.selection_made = True
+        self.save_current_comparison()
 
         # Record history
         record = ComparisonRecord(
@@ -1180,13 +1396,13 @@ class ArtistELORanker:
         # Format result message
         winner_artists = ", ".join(winners)
         loser_artists = ", ".join(losers)
-        result_msg = f"**Winner:** {winner_artists}\n**Loser:** {loser_artists}"
+        result_msg = f"**승리:** {winner_artists}\n**패배:** {loser_artists}"
 
         # Show artist details
-        details = "### Artist Details\n"
-        details += f"**Image A artists:** {', '.join(self.current_artists_a)}\n"
-        details += f"**Image B artists:** {', '.join(self.current_artists_b)}\n\n"
-        details += "**Updated ELO ratings:**\n"
+        details = "### 작가 상세\n"
+        details += f"**이미지 A:** {', '.join(self.current_artists_a)}\n"
+        details += f"**이미지 B:** {', '.join(self.current_artists_b)}\n\n"
+        details += "**변경된 ELO:**\n"
         for artist in winners + losers:
             rating = self.elo_system.get_rating(artist)
             details += f"- {artist}: {rating:.0f}\n"
@@ -1206,7 +1422,7 @@ class ArtistELORanker:
             return (
                 None,  # image_a
                 None,  # image_b
-                "Nothing to undo.",
+                "되돌릴 선택이 없습니다.",
                 self.format_top_artists_display(),
                 "",
                 "",
@@ -1247,11 +1463,12 @@ class ArtistELORanker:
         # Clear undo state and reset selection
         self.last_undo_state = None
         self.selection_made = False
+        self.save_current_comparison()
 
         return (
             state.prev_image_a,  # image_a
             state.prev_image_b,  # image_b
-            "**Undone!** Pick again.",
+            "**선택을 되돌렸습니다.** 다시 선택하세요.",
             self.format_top_artists_display(),
             "",  # Clear result_msg
             "",  # Clear details_msg
@@ -1264,73 +1481,91 @@ class ArtistELORanker:
         """Create the Gradio interface."""
 
         with gr.Blocks(title="Artist ELO Ranker") as app:
-            gr.Markdown("# Artist ELO Ranking System")
-            gr.Markdown(
-                "Compare images generated with different artist combinations. "
-                "Pick your preferred image to update ELO ratings. "
-                "The artist tags are hidden during comparison for unbiased selection.  \n"
-                "**Shortcuts:** `1` = Pick A, `2` = Pick B, `s` = Skip, `0` = Undo"
-            )
+            with gr.Column(elem_id="app-header"):
+                gr.Markdown("# Artist ELO Ranker")
+                gr.Markdown(
+                    "두 이미지를 비교해 더 마음에 드는 쪽을 선택하세요. "
+                    "선택 전에는 작가 태그가 숨겨집니다.  \n"
+                    "<span id='desktop-help'>키보드: `1` A 선택 · `2` B 선택 · `S` 건너뛰기 · `0` 되돌리기</span>"
+                )
 
-            with gr.Row():
+            with gr.Row(elem_id="main-layout"):
                 # Main comparison area (left side)
                 with gr.Column(scale=2):
                     # Prompt input
-                    with gr.Accordion("Custom Prompts (Optional)", open=False):
+                    with gr.Accordion("생성 설정", open=False):
                         prompt_input = gr.Textbox(
-                            label="Positive Prompt",
-                            placeholder="Enter custom prompt (artist tags will be auto-inserted)...",
+                            label="프롬프트",
+                            placeholder="비워 두면 기본 프롬프트를 사용합니다. 작가 태그는 자동으로 들어갑니다.",
                             lines=4,
-                            value=""
+                            value=self.current_custom_prompt,
                         )
                         negative_prompt_input = gr.Textbox(
-                            label="Negative Prompt",
-                            placeholder="Enter custom negative prompt (leave empty for default)...",
+                            label="네거티브 프롬프트",
+                            placeholder="비워 두면 기본 네거티브 프롬프트를 사용합니다.",
                             lines=3,
-                            value=""
+                            value=self.current_negative_prompt,
                         )
                         with gr.Row():
                             quality_toggle = gr.Checkbox(
-                                label="Add quality tags",
-                                value=True,
-                                info="Adds 'very aesthetic, masterpiece, no text' to prompt"
+                                label="품질 태그 추가",
+                                value=self.current_quality_toggle,
+                                info="very aesthetic, masterpiece, no text를 추가합니다.",
                             )
                             uc_preset_dropdown = gr.Dropdown(
-                                label="Auto-Negative Preset",
+                                label="자동 네거티브 프리셋",
                                 choices=[
-                                    ("None - no auto-negatives", -1),
-                                    ("Heavy - standard quality filters", 0),
-                                    ("Light - minimal quality filters", 1),
-                                    ("Human Focus - optimized for characters", 2),
-                                    ("Heavy + Anatomy - includes body fixes", 3),
+                                    ("없음", -1),
+                                    ("Heavy · 표준 품질 필터", 0),
+                                    ("Light · 최소 필터", 1),
+                                    ("Human Focus · 인물 중심", 2),
+                                    ("Heavy + Anatomy · 신체 보정", 3),
                                 ],
-                                value=0,
+                                value=self.current_uc_preset,
                                 interactive=True,
                             )
                         gr.Markdown(
-                            "*Leave prompts empty to use defaults. Artist tags are only inserted into the positive prompt.*"
+                            "*`{artist_placeholder}`를 넣으면 해당 위치에 작가 태그가 삽입됩니다.*"
                         )
 
                     # Status message
-                    status_msg = gr.Markdown("Generating first comparison...")
+                    status_msg = gr.Markdown("비교 이미지를 준비하고 있습니다…", elem_id="status-card")
 
                     # Image comparison
-                    with gr.Row():
-                        with gr.Column():
-                            image_a = gr.Image(label="Image A", type="filepath")
+                    with gr.Row(elem_id="comparison-row"):
+                        with gr.Column(elem_classes=["image-card"]):
+                            image_a = gr.Image(
+                                label="이미지 A",
+                                type="filepath",
+                                buttons=["fullscreen"],
+                                elem_classes=["comparison-image"],
+                            )
                             artists_a_display = gr.Markdown("", visible=False)
-                            pick_a_btn = gr.Button("Pick Image A", variant="secondary", size="lg")
 
-                        with gr.Column():
-                            image_b = gr.Image(label="Image B", type="filepath")
+                        with gr.Column(elem_classes=["image-card"]):
+                            image_b = gr.Image(
+                                label="이미지 B",
+                                type="filepath",
+                                buttons=["fullscreen"],
+                                elem_classes=["comparison-image"],
+                            )
                             artists_b_display = gr.Markdown("", visible=False)
-                            pick_b_btn = gr.Button("Pick Image B", variant="secondary", size="lg")
 
-                    # Show artists toggle, skip, and undo buttons
-                    with gr.Row():
-                        show_artists_toggle = gr.Checkbox(label="Show artist tags", value=False)
-                        skip_btn = gr.Button("Skip", variant="secondary", size="sm")
-                        undo_btn = gr.Button("Undo Last Selection", variant="stop", size="sm", interactive=False)
+                    # Large, thumb-friendly controls stay reachable while scrolling.
+                    with gr.Row(elem_id="vote-dock"):
+                        pick_a_btn = gr.Button("A 선택", variant="primary", size="lg", elem_id="vote-a")
+                        pick_b_btn = gr.Button("B 선택", variant="primary", size="lg", elem_id="vote-b")
+
+                    with gr.Row(elem_id="secondary-actions"):
+                        skip_btn = gr.Button("건너뛰기", variant="secondary", size="sm", elem_id="skip-button")
+                        undo_btn = gr.Button(
+                            "마지막 선택 되돌리기",
+                            variant="stop",
+                            size="sm",
+                            interactive=False,
+                            elem_id="undo-button",
+                        )
+                    show_artists_toggle = gr.Checkbox(label="작가 태그 보기", value=False)
 
                     # Result display
                     result_msg = gr.Markdown("")
@@ -1338,15 +1573,16 @@ class ArtistELORanker:
 
                 # Leaderboard (right side)
                 with gr.Column(scale=1):
-                    leaderboard = gr.Markdown(
-                        self.format_top_artists_display(),
-                        label="Top Artists"
-                    )
-                    export_btn = gr.Button("Export Leaderboard as CSV")
+                    with gr.Accordion("랭킹과 풀 통계", open=True):
+                        leaderboard = gr.Markdown(
+                            self.format_top_artists_display(),
+                            label="Top Artists",
+                        )
+                    export_btn = gr.Button("랭킹 CSV 내보내기")
                     export_file = gr.File(label="Download", visible=False)
 
                     # Comparison history panel
-                    with gr.Accordion("Comparison History", open=False):
+                    with gr.Accordion("최근 비교 기록", open=False):
                         history_display = gr.Markdown(self.format_recent_history())
 
             # Event handlers
@@ -1356,12 +1592,46 @@ class ArtistELORanker:
                 try:
                     result = loop.run_until_complete(self.generate_new_comparison(prompt, negative_prompt, quality_tags, uc_preset))
                     # Add artist display text and history to result
-                    artists_a_text = f"**Artists:** {', '.join(self.current_artists_a)}"
-                    artists_b_text = f"**Artists:** {', '.join(self.current_artists_b)}"
+                    artists_a_text = f"**작가:** {', '.join(self.current_artists_a)}"
+                    artists_b_text = f"**작가:** {', '.join(self.current_artists_b)}"
                     history_text = self.format_recent_history()
                     return result + (artists_a_text, artists_b_text, history_text)
                 finally:
                     loop.close()
+
+            def on_initial_load(prompt, negative_prompt, quality_tags, uc_preset):
+                """Reuse a saved pair on refresh; only generate when none exists."""
+                has_saved_pair = (
+                    self.current_image_a
+                    and self.current_image_b
+                    and self.current_image_a.is_file()
+                    and self.current_image_b.is_file()
+                    and self.current_artists_a
+                    and self.current_artists_b
+                )
+                if not has_saved_pair:
+                    return on_generate(prompt, negative_prompt, quality_tags, uc_preset)
+
+                can_pick = not self.selection_made
+                status = (
+                    "저장된 비교를 불러왔습니다. 더 마음에 드는 이미지를 선택하세요."
+                    if can_pick
+                    else "이 비교는 이미 선택되었습니다. 건너뛰기를 눌러 다음 비교를 생성하세요."
+                )
+                return (
+                    str(self.current_image_a),
+                    str(self.current_image_b),
+                    status,
+                    self.format_top_artists_display(),
+                    "",
+                    "",
+                    gr.update(interactive=can_pick),
+                    gr.update(interactive=can_pick),
+                    gr.update(interactive=self.last_undo_state is not None),
+                    f"**작가:** {', '.join(self.current_artists_a)}",
+                    f"**작가:** {', '.join(self.current_artists_b)}",
+                    self.format_recent_history(),
+                )
 
             def on_pick_then_generate(prompt, negative_prompt, quality_tags, uc_preset):
                 """Generate new comparison after pick (for chaining)."""
@@ -1369,8 +1639,8 @@ class ArtistELORanker:
                 asyncio.set_event_loop(loop)
                 try:
                     result = loop.run_until_complete(self.generate_new_comparison(prompt, negative_prompt, quality_tags, uc_preset))
-                    artists_a_text = f"**Artists:** {', '.join(self.current_artists_a)}"
-                    artists_b_text = f"**Artists:** {', '.join(self.current_artists_b)}"
+                    artists_a_text = f"**작가:** {', '.join(self.current_artists_a)}"
+                    artists_b_text = f"**작가:** {', '.join(self.current_artists_b)}"
                     history_text = self.format_recent_history()
                     return result + (artists_a_text, artists_b_text, history_text)
                 finally:
@@ -1395,14 +1665,14 @@ class ArtistELORanker:
             def on_undo():
                 """Undo and restore artist display text."""
                 result = self.undo_last_selection()
-                artists_a_text = f"**Artists:** {', '.join(self.current_artists_a)}" if self.current_artists_a else ""
-                artists_b_text = f"**Artists:** {', '.join(self.current_artists_b)}" if self.current_artists_b else ""
+                artists_a_text = f"**작가:** {', '.join(self.current_artists_a)}" if self.current_artists_a else ""
+                artists_b_text = f"**작가:** {', '.join(self.current_artists_b)}" if self.current_artists_b else ""
                 history_text = self.format_recent_history()
                 return result + (artists_a_text, artists_b_text, history_text)
 
             # Auto-generate first comparison on app load
             app.load(
-                fn=on_generate,
+                fn=on_initial_load,
                 inputs=[prompt_input, negative_prompt_input, quality_toggle, uc_preset_dropdown],
                 outputs=[image_a, image_b, status_msg, leaderboard, result_msg, details_msg, pick_a_btn, pick_b_btn, undo_btn, artists_a_display, artists_b_display, history_display]
             )
@@ -1474,28 +1744,23 @@ class ArtistELORanker:
                         // Ignore if typing in a text field
                         if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
-                        const findAndClick = (text) => {
-                            const btns = document.querySelectorAll('button');
-                            for (const b of btns) {
-                                if (b.textContent.includes(text)) {
-                                    // Check if not disabled (Gradio uses multiple ways)
-                                    if (!b.disabled && !b.classList.contains('disabled') && b.getAttribute('aria-disabled') !== 'true') {
-                                        b.click();
-                                        return true;
-                                    }
-                                }
-                            }
-                            return false;
+                        const clickControl = (id) => {
+                            const root = document.getElementById(id);
+                            if (!root) return false;
+                            const button = root.matches('button') ? root : root.querySelector('button');
+                            if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return false;
+                            button.click();
+                            return true;
                         };
 
                         if (e.key === '1') {
-                            findAndClick('Pick Image A');
+                            clickControl('vote-a');
                         } else if (e.key === '2') {
-                            findAndClick('Pick Image B');
+                            clickControl('vote-b');
                         } else if (e.key === 's' || e.key === 'S') {
-                            findAndClick('Skip');
+                            clickControl('skip-button');
                         } else if (e.key === '0') {
-                            findAndClick('Undo');
+                            clickControl('undo-button');
                         }
                     });
                     return [];
@@ -1514,19 +1779,36 @@ def main():
     """Main entry point."""
     print("Starting Artist ELO Ranker...")
     print(f"Artist tags file: {ARTIST_TAGS_FILE}")
+    print(f"Data directory: {DATA_DIR}")
     print(f"ELO ratings file: {ELO_RATINGS_FILE}")
     print(f"Comparison images dir: {COMPARISON_IMAGES_DIR}")
 
+    public_bind = SERVER_HOST not in {"127.0.0.1", "localhost", "::1"}
+    if public_bind and len(APP_PASSWORD) < 8:
+        raise ValueError(
+            "APP_PASSWORD must contain at least 8 characters when SERVER_HOST "
+            "is exposed beyond this device. Set it as a secret environment variable."
+        )
+
     ranker = ArtistELORanker()
     app = ranker.create_ui()
+    auth = (APP_USERNAME, APP_PASSWORD) if APP_PASSWORD else None
 
     # Launch the app
     app.launch(
         share=False,
         server_name=SERVER_HOST,
         server_port=SERVER_PORT,
-        inbrowser=True,
-        theme=gr.themes.Soft()
+        inbrowser=INBROWSER,
+        auth=auth,
+        auth_message="개인용 Artist ELO입니다. 설정한 계정으로 로그인하세요.",
+        theme=gr.themes.Soft(),
+        css=MOBILE_CSS,
+        head=APP_HEAD,
+        pwa=True,
+        allowed_paths=[str(COMPARISON_IMAGES_DIR)],
+        enable_monitoring=False,
+        footer_links=[],
     )
 
 
