@@ -39,10 +39,17 @@ def get_api_key() -> str:
 
 SCRIPT_DIR = Path(__file__).parent
 ARTIST_TAGS_FILE = SCRIPT_DIR / "danbooru_artist_tags_v4.5.txt"
-COMPARISON_IMAGES_DIR = SCRIPT_DIR / "comparison_images"
-ELO_RATINGS_FILE = SCRIPT_DIR / "artist_elo_ratings.json"
-COMPARISON_HISTORY_FILE = SCRIPT_DIR / "comparison_history.json"
-ACTIVE_POOL_FILE = SCRIPT_DIR / "active_pool.json"
+
+# Keep mutable user data outside the application directory when DATA_DIR is set.
+# This is especially important on cloud hosts, where the application filesystem
+# is often replaced during every deploy. A mounted persistent disk can be exposed
+# to the app by setting DATA_DIR (for example, /data).
+DATA_DIR = Path(os.getenv("DATA_DIR", str(SCRIPT_DIR))).expanduser().resolve()
+COMPARISON_IMAGES_DIR = DATA_DIR / "comparison_images"
+ELO_RATINGS_FILE = DATA_DIR / "artist_elo_ratings.json"
+COMPARISON_HISTORY_FILE = DATA_DIR / "comparison_history.json"
+ACTIVE_POOL_FILE = DATA_DIR / "active_pool.json"
+CURRENT_COMPARISON_FILE = DATA_DIR / "current_comparison.json"
 
 
 # --------------------------------------------------------------------------------
@@ -77,7 +84,12 @@ LOSER_ROTATION_PROBABILITY = float(os.getenv("LOSER_ROTATION_PROB", "0.4"))
 # --------------------------------------------------------------------------------
 
 SERVER_HOST = os.getenv("SERVER_HOST", "127.0.0.1")
-SERVER_PORT = int(os.getenv("SERVER_PORT", "7860"))
+# Most hosting platforms provide PORT dynamically. SERVER_PORT remains useful
+# for local runs and hosts that allow a fixed port.
+SERVER_PORT = int(os.getenv("PORT", os.getenv("SERVER_PORT", "7860")))
+APP_USERNAME = os.getenv("APP_USERNAME", "artist")
+APP_PASSWORD = os.getenv("APP_PASSWORD", "").strip()
+INBROWSER = os.getenv("INBROWSER", "true").lower() in {"1", "true", "yes", "on"}
 
 
 # --------------------------------------------------------------------------------

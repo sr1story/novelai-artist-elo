@@ -25,6 +25,12 @@ A web-based blind comparison system that ranks Danbooru artist tags by generatin
 - A [NovelAI](https://novelai.net/) subscription with API access
 - The artist tags file (`danbooru_artist_tags_v4.5.txt`)
 
+## Personal Mobile Web
+
+The interface includes a mobile-first layout, large touch voting controls, optional login protection, and persistent data-directory support. A Dockerfile and Render Blueprint are included for running it without keeping a PC online.
+
+See **[MOBILE_DEPLOY.md](MOBILE_DEPLOY.md)** for the Korean phone-only deployment guide. Never commit your NovelAI token or app password to GitHub.
+
 ## Installation
 
 1. **Clone the repository**
@@ -225,6 +231,10 @@ All configuration is done via environment variables in the `.env` file:
 | `POOL_SIZE` | 150 | Active pool size |
 | `SERVER_HOST` | 127.0.0.1 | Server bind address |
 | `SERVER_PORT` | 7860 | Server port |
+| `APP_USERNAME` | artist | Personal web login username |
+| `APP_PASSWORD` | (optional locally) | Required, minimum 8 characters when exposed online |
+| `DATA_DIR` | Project directory | Persistent directory for rankings, history, and images |
+| `INBROWSER` | true | Automatically open a local browser on startup |
 | `DEFAULT_PROMPT` | (built-in) | Default positive prompt. Use `{artist_placeholder}` for artist tags. Wrap in quotes. |
 | `NEGATIVE_PROMPT` | (built-in) | Default negative prompt. Wrap in quotes. |
 

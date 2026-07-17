@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: novelai-artist-elo-mobile
+    runtime: docker
+    plan: starter
+    region: singapore
+    numInstances: 1
+    autoDeployTrigger: commit
+    healthCheckPath: /
+    envVars:
+      - key: NOVELAI_API_KEY
+        sync: false
+      - key: APP_USERNAME
+        value: artist
+      - key: APP_PASSWORD
+        sync: false
+      - key: DATA_DIR
+        value: /data
+      - key: SERVER_HOST
+        value: 0.0.0.0
+      - key: INBROWSER
+        value: "false"
+    disk:
+      name: artist-elo-data
+      mountPath: /data
+      sizeGB: 5
