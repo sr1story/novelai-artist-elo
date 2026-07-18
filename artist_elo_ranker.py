@@ -9,6 +9,7 @@ based on the outcomes.
 
 import asyncio
 import json
+import math
 import random
 import re
 import time
@@ -183,6 +184,66 @@ MOBILE_CSS = """
 
 
 # --------------------------------------------------------------------------------
+# Ranking direction presets
+# --------------------------------------------------------------------------------
+
+RANKING_MODE_BALANCED = "balanced"
+RANKING_MODE_NEWCOMERS = "newcomers"
+RANKING_MODE_TOP = "top"
+RANKING_MODE_FAST_ROTATION = "fast_rotation"
+
+RANKING_MODE_CONFIG = {
+    RANKING_MODE_BALANCED: {
+        "label": "균형 · 기존",
+        "description": "기존 방식입니다. 비교 횟수가 적은 작가를 완만하게 우선합니다.",
+        "removal_probability": 0.15,
+        "addition_probability": 0.15,
+    },
+    RANKING_MODE_NEWCOMERS: {
+        "label": "신규 탐색",
+        "description": "비교 5회 미만 작가와 아직 평가하지 않은 작가를 더 자주 보여줍니다.",
+        "removal_probability": 0.28,
+        "addition_probability": 0.28,
+    },
+    RANKING_MODE_TOP: {
+        "label": "상위권 정밀화",
+        "description": "비교 5회 이상인 상위 30% 작가를 더 자주 비교합니다.",
+        "removal_probability": 0.08,
+        "addition_probability": 0.08,
+    },
+    RANKING_MODE_FAST_ROTATION: {
+        "label": "빠른 교체",
+        "description": "충분히 평가됐지만 평균보다 낮은 작가를 재검증하고 풀 교체를 빠르게 합니다.",
+        "removal_probability": 0.35,
+        "addition_probability": 0.35,
+    },
+}
+
+RANKING_MODE_CHOICES = [
+    (settings["label"], mode)
+    for mode, settings in RANKING_MODE_CONFIG.items()
+]
+MODE_FOCUS_PROBABILITY = 0.70
+MIN_CONFIDENT_COMPARISONS = 5
+TOP_ARTIST_FRACTION = 0.30
+
+
+def normalize_ranking_mode(mode: str) -> str:
+    """Return a supported ranking mode, falling back to the existing strategy."""
+    return mode if mode in RANKING_MODE_CONFIG else RANKING_MODE_BALANCED
+
+
+def get_ranking_mode_label(mode: str) -> str:
+    """Return the user-facing label for a ranking mode."""
+    return RANKING_MODE_CONFIG[normalize_ranking_mode(mode)]["label"]
+
+
+def get_ranking_mode_description(mode: str) -> str:
+    """Return the short explanation shown below the mode dropdown."""
+    return RANKING_MODE_CONFIG[normalize_ranking_mode(mode)]["description"]
+
+
+# --------------------------------------------------------------------------------
 # ELO Rating System
 # --------------------------------------------------------------------------------
 
@@ -327,7 +388,8 @@ class ActivePool:
     - Winners stay in the pool (good artists get more comparisons)
     - Losers may get rotated out (with some probability)
     - Periodically introduce new random artists to discover hidden gems
-    - Weight selection towards artists with fewer comparisons (need more data)
+    - Weight selection according to the selected ranking direction preset
+    - Keep 30% of selections on the balanced strategy to preserve coverage
     """
 
     def __init__(self, all_artists: List[str], elo_system: ELOSystem,
@@ -337,6 +399,7 @@ class ActivePool:
         self.pool_size = pool_size
         self.pool_file = pool_file or ACTIVE_POOL_FILE
         self.pool: List[str] = []
+        self.ranking_mode = RANKING_MODE_BALANCED
         self.load()
 
     def load(self):
@@ -345,6 +408,9 @@ class ActivePool:
             with open(self.pool_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 self.pool = data.get("pool", [])
+                self.ranking_mode = normalize_ranking_mode(
+                    data.get("ranking_mode", RANKING_MODE_BALANCED)
+                )
                 # Validate pool members still exist in all_artists
                 self.pool = [a for a in self.pool if a in self.all_artists]
 
@@ -355,7 +421,22 @@ class ActivePool:
     def save(self):
         """Save pool to file."""
         with open(self.pool_file, "w", encoding="utf-8") as f:
-            json.dump({"pool": self.pool}, f, indent=2)
+            json.dump({
+                "pool": self.pool,
+                "ranking_mode": self.ranking_mode,
+            }, f, indent=2)
+
+    def set_ranking_mode(self, mode: str) -> str:
+        """Set and persist the ranking direction preset."""
+        normalized = normalize_ranking_mode(mode)
+        if normalized != self.ranking_mode:
+            self.ranking_mode = normalized
+            self.save()
+        return self.ranking_mode
+
+    def get_ranking_mode(self) -> str:
+        """Return the active ranking direction preset."""
+        return self.ranking_mode
 
     def _refill_pool(self):
         """Fill pool up to pool_size with random artists not already in pool."""
@@ -377,24 +458,76 @@ class ActivePool:
         # Add 1 to avoid division by zero, use sqrt to dampen the effect
         return 1.0 / (1.0 + (comparisons ** 0.5))
 
+    @staticmethod
+    def _weighted_choice(candidates: List[str], weights: List[float]) -> str:
+        """Select one candidate using non-negative weights."""
+        total_weight = sum(weights)
+        if total_weight <= 0:
+            return random.choice(candidates)
+
+        target = random.uniform(0, total_weight)
+        cumulative = 0.0
+        for artist, weight in zip(candidates, weights):
+            effective_weight = max(0.0, weight)
+            if effective_weight == 0:
+                continue
+            cumulative += effective_weight
+            if target <= cumulative:
+                return artist
+        return candidates[-1]
+
+    def _get_focus_candidates(self, candidates: List[str]) -> List[str]:
+        """Return the artists emphasized by the active direction preset."""
+        if self.ranking_mode == RANKING_MODE_NEWCOMERS:
+            return [
+                artist for artist in candidates
+                if self.elo_system.get_artist_comparison_count(artist)
+                < MIN_CONFIDENT_COMPARISONS
+            ]
+
+        confident = [
+            artist for artist in candidates
+            if self.elo_system.get_artist_comparison_count(artist)
+            >= MIN_CONFIDENT_COMPARISONS
+        ]
+        if not confident:
+            return []
+
+        if self.ranking_mode == RANKING_MODE_TOP:
+            top_count = max(1, math.ceil(len(confident) * TOP_ARTIST_FRACTION))
+            return sorted(
+                confident,
+                key=lambda artist: self.elo_system.get_rating(artist),
+                reverse=True,
+            )[:top_count]
+
+        if self.ranking_mode == RANKING_MODE_FAST_ROTATION:
+            pool_average = sum(
+                self.elo_system.get_rating(artist) for artist in self.pool
+            ) / len(self.pool)
+            return [
+                artist for artist in confident
+                if self.elo_system.get_rating(artist) < pool_average
+            ]
+
+        return []
+
+    def _select_from_candidates(self, candidates: List[str]) -> str:
+        """Select an artist with a 70/30 preset-to-balanced mixture."""
+        selection_pool = candidates
+        if self.ranking_mode != RANKING_MODE_BALANCED:
+            focus_candidates = self._get_focus_candidates(candidates)
+            if focus_candidates and random.random() < MODE_FOCUS_PROBABILITY:
+                selection_pool = focus_candidates
+
+        weights = [self.get_selection_weight(artist) for artist in selection_pool]
+        return self._weighted_choice(selection_pool, weights)
+
     def select_artist(self) -> str:
-        """Select a single artist from the pool, weighted by need for comparisons."""
+        """Select a single artist according to the active direction preset."""
         if not self.pool:
             self._refill_pool()
-
-        weights = [self.get_selection_weight(a) for a in self.pool]
-        total_weight = sum(weights)
-        if total_weight == 0:
-            return random.choice(self.pool)
-
-        # Weighted random selection
-        r = random.uniform(0, total_weight)
-        cumulative = 0
-        for artist, weight in zip(self.pool, weights):
-            cumulative += weight
-            if r <= cumulative:
-                return artist
-        return self.pool[-1]
+        return self._select_from_candidates(self.pool)
 
     def select_combination(self, min_artists: int = 1, max_artists: int = 3) -> List[str]:
         """Select a combination of 1-3 artists from the pool."""
@@ -410,19 +543,7 @@ class ActivePool:
         for _ in range(num_artists):
             if not pool_copy:
                 break
-            weights = [self.get_selection_weight(a) for a in pool_copy]
-            total_weight = sum(weights)
-            if total_weight == 0:
-                artist = random.choice(pool_copy)
-            else:
-                r = random.uniform(0, total_weight)
-                cumulative = 0
-                artist = pool_copy[-1]
-                for a, w in zip(pool_copy, weights):
-                    cumulative += w
-                    if r <= cumulative:
-                        artist = a
-                        break
+            artist = self._select_from_candidates(pool_copy)
             selected.append(artist)
             pool_copy.remove(artist)
 
@@ -440,7 +561,8 @@ class ActivePool:
         rotated_out = []  # [(artist, elo), ...]
         rotated_in = []   # [(artist, elo, is_returning), ...]
 
-        # Determine probabilities based on pool size
+        # Determine probabilities based on pool size. Around the configured
+        # target, the active direction preset controls turnover speed.
         pool_diff = len(self.pool) - self.pool_size
         if pool_diff > 10:  # Pool too big
             removal_prob = 0.3
@@ -449,8 +571,9 @@ class ActivePool:
             removal_prob = 0.05
             addition_prob = 0.3
         else:  # Around target
-            removal_prob = 0.15
-            addition_prob = 0.15
+            mode_config = RANKING_MODE_CONFIG[self.ranking_mode]
+            removal_prob = mode_config["removal_probability"]
+            addition_prob = mode_config["addition_probability"]
 
         # Weighted removal from entire pool (not just losers)
         # Weight = confidence(matches) * underperformance(relative to pool max)
@@ -463,8 +586,10 @@ class ActivePool:
                 matches = self.elo_system.get_artist_comparison_count(artist)
                 elo = self.elo_system.get_rating(artist)
 
-                # Confidence: need enough matches before judging (0-5 matches → 0-1)
-                confidence = min(1.0, matches / 5.0)
+                # Newcomers are protected until they have enough comparisons.
+                confidence = (
+                    1.0 if matches >= MIN_CONFIDENT_COMPARISONS else 0.0
+                )
 
                 # Underperformance: relative to pool's best performer (squared)
                 # Squared so worst performers are MUCH more likely to be removed
@@ -479,6 +604,8 @@ class ActivePool:
                 r = random.uniform(0, total_weight)
                 cumulative = 0
                 for artist, weight in zip(self.pool, removal_weights):
+                    if weight <= 0:
+                        continue
                     cumulative += weight
                     if r <= cumulative:
                         elo = self.elo_system.get_rating(artist)
@@ -492,6 +619,17 @@ class ActivePool:
         if random.random() < addition_prob:
             available = [a for a in self.all_artists if a not in self.pool]
             if available:
+                # Newcomer mode spends 70% of its focused additions on artists
+                # that have never received an ELO result. The remaining 30%
+                # uses the existing high-ELO return weighting.
+                if (
+                    self.ranking_mode == RANKING_MODE_NEWCOMERS
+                    and random.random() < MODE_FOCUS_PROBABILITY
+                ):
+                    fresh = [a for a in available if a not in self.elo_system.ratings]
+                    if fresh:
+                        available = fresh
+
                 elos = [self.elo_system.get_rating(a) for a in available]
                 min_elo = min(elos)
                 # Square the weight difference for stronger high-ELO preference
@@ -549,6 +687,16 @@ class ActivePool:
                 self.pool.append(artist)
         self.save()
 
+    def revert_rotation(self, rotated_out: List[str], rotated_in: List[str]):
+        """Undo every pool membership change made by the latest comparison."""
+        for artist in rotated_in:
+            if artist in self.pool:
+                self.pool.remove(artist)
+        for artist in rotated_out:
+            if artist not in self.pool and artist in self.all_artists:
+                self.pool.append(artist)
+        self.save()
+
     def get_pool_stats(self) -> dict:
         """Get statistics about the current pool."""
         if not self.pool:
@@ -595,6 +743,7 @@ class ActivePool:
             "at_risk_count": len(at_risk),
             "newcomers": newcomers,
             "safe": safe,
+            "ranking_mode": self.ranking_mode,
         }
 
 
@@ -644,10 +793,27 @@ class ArtistTagManager:
             return self.active_pool.process_result(winners, losers)
         return [], []
 
+    def set_ranking_mode(self, mode: str) -> str:
+        """Set and persist the active ranking direction preset."""
+        if self.active_pool:
+            return self.active_pool.set_ranking_mode(mode)
+        return normalize_ranking_mode(mode)
+
+    def get_ranking_mode(self) -> str:
+        """Return the active ranking direction preset."""
+        if self.active_pool:
+            return self.active_pool.get_ranking_mode()
+        return RANKING_MODE_BALANCED
+
     def restore_artists(self, artists: List[str]):
         """Restore artists to the pool (for undo)."""
         if self.active_pool:
             self.active_pool.restore_artists(artists)
+
+    def revert_rotation(self, rotated_out: List[str], rotated_in: List[str]):
+        """Undo pool additions and removals from the latest comparison."""
+        if self.active_pool:
+            self.active_pool.revert_rotation(rotated_out, rotated_in)
 
     def get_pool_stats(self) -> dict:
         """Get active pool statistics."""
@@ -961,6 +1127,7 @@ class UndoState:
     old_ratings: dict  # artist -> old rating
     old_comparisons: dict  # artist -> old comparison count
     rotated_out: List[str]  # artists that were rotated out of pool
+    rotated_in: List[str]  # artists that were added to the pool
     # Previous comparison images (for restoring on undo)
     prev_image_a: Optional[str] = None
     prev_image_b: Optional[str] = None
@@ -1186,7 +1353,10 @@ class ArtistELORanker:
         lines.append("")
         lines.append(f"**전체 비교:** {self.elo_system.comparison_count}  ")
         lines.append(f"**평가한 작가:** {len(self.elo_system.ratings)}  ")
-        lines.append(f"**활성 풀:** {pool_stats.get('size', 0)}/{pool_stats.get('total_artists', 0)}")
+        lines.append(f"**활성 풀:** {pool_stats.get('size', 0)}/{pool_stats.get('total_artists', 0)}  ")
+        lines.append(
+            f"**평가 방향:** {get_ranking_mode_label(self.artist_manager.get_ranking_mode())}"
+        )
 
         # Pool health breakdown
         lines.append("")
@@ -1222,10 +1392,18 @@ class ArtistELORanker:
 
         return "\n".join(lines)
 
-    async def generate_new_comparison(self, custom_prompt: str, custom_negative_prompt: str = "", quality_toggle: bool = True, uc_preset: int = 0):
+    async def generate_new_comparison(
+        self,
+        custom_prompt: str,
+        custom_negative_prompt: str = "",
+        quality_toggle: bool = True,
+        uc_preset: int = 0,
+        ranking_mode: str = RANKING_MODE_BALANCED,
+    ):
         """Generate a new pair of images for comparison."""
         custom_prompt = custom_prompt or ""
         custom_negative_prompt = custom_negative_prompt or ""
+        self.artist_manager.set_ranking_mode(ranking_mode)
 
         # Use custom prompt if provided, otherwise default
         base_prompt = custom_prompt.strip() if custom_prompt.strip() else DEFAULT_PROMPT
@@ -1368,12 +1546,14 @@ class ArtistELORanker:
         # Save undo state (including current images for restoration)
         # Extract just artist names for undo
         rotated_out_names = [artist for artist, elo in rotated_out]
+        rotated_in_names = [artist for artist, elo, is_returning in rotated_in]
         self.last_undo_state = UndoState(
             winners=winners.copy(),
             losers=losers.copy(),
             old_ratings=old_ratings,
             old_comparisons=old_comparisons,
             rotated_out=rotated_out_names,
+            rotated_in=rotated_in_names,
             prev_image_a=str(self.current_image_a) if self.current_image_a else None,
             prev_image_b=str(self.current_image_b) if self.current_image_b else None,
             prev_artists_a=self.current_artists_a.copy(),
@@ -1445,9 +1625,20 @@ class ArtistELORanker:
         self.elo_system.comparison_count -= 1
         self.elo_system.save(ELO_RATINGS_FILE)
 
-        # Restore rotated out artists to pool
-        if state.rotated_out:
-            self.artist_manager.restore_artists(state.rotated_out)
+        # Restore all active-pool changes, including newly added artists.
+        if state.rotated_out or state.rotated_in:
+            self.artist_manager.revert_rotation(state.rotated_out, state.rotated_in)
+
+        # Remove the corresponding entries from the in-memory rotation log.
+        for rotation_type, artists in (
+            ("out", state.rotated_out),
+            ("in", state.rotated_in),
+        ):
+            for artist in artists:
+                for index, entry in enumerate(self.rotation_log):
+                    if entry[0] == rotation_type and entry[1] == artist:
+                        self.rotation_log.pop(index)
+                        break
 
         # Remove last history record
         if self.history.records:
@@ -1492,6 +1683,18 @@ class ArtistELORanker:
             with gr.Row(elem_id="main-layout"):
                 # Main comparison area (left side)
                 with gr.Column(scale=2):
+                    ranking_mode_dropdown = gr.Dropdown(
+                        label="평가 방향",
+                        choices=RANKING_MODE_CHOICES,
+                        value=self.artist_manager.get_ranking_mode(),
+                        interactive=True,
+                    )
+                    ranking_mode_help = gr.Markdown(
+                        get_ranking_mode_description(
+                            self.artist_manager.get_ranking_mode()
+                        )
+                    )
+
                     # Prompt input
                     with gr.Accordion("생성 설정", open=False):
                         prompt_input = gr.Textbox(
@@ -1586,11 +1789,19 @@ class ArtistELORanker:
                         history_display = gr.Markdown(self.format_recent_history())
 
             # Event handlers
-            def on_generate(prompt, negative_prompt, quality_tags, uc_preset):
+            def on_generate(prompt, negative_prompt, quality_tags, uc_preset, ranking_mode):
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
-                    result = loop.run_until_complete(self.generate_new_comparison(prompt, negative_prompt, quality_tags, uc_preset))
+                    result = loop.run_until_complete(
+                        self.generate_new_comparison(
+                            prompt,
+                            negative_prompt,
+                            quality_tags,
+                            uc_preset,
+                            ranking_mode,
+                        )
+                    )
                     # Add artist display text and history to result
                     artists_a_text = f"**작가:** {', '.join(self.current_artists_a)}"
                     artists_b_text = f"**작가:** {', '.join(self.current_artists_b)}"
@@ -1599,8 +1810,9 @@ class ArtistELORanker:
                 finally:
                     loop.close()
 
-            def on_initial_load(prompt, negative_prompt, quality_tags, uc_preset):
+            def on_initial_load(prompt, negative_prompt, quality_tags, uc_preset, ranking_mode):
                 """Reuse a saved pair on refresh; only generate when none exists."""
+                self.artist_manager.set_ranking_mode(ranking_mode)
                 has_saved_pair = (
                     self.current_image_a
                     and self.current_image_b
@@ -1610,7 +1822,13 @@ class ArtistELORanker:
                     and self.current_artists_b
                 )
                 if not has_saved_pair:
-                    return on_generate(prompt, negative_prompt, quality_tags, uc_preset)
+                    return on_generate(
+                        prompt,
+                        negative_prompt,
+                        quality_tags,
+                        uc_preset,
+                        ranking_mode,
+                    )
 
                 can_pick = not self.selection_made
                 status = (
@@ -1633,12 +1851,20 @@ class ArtistELORanker:
                     self.format_recent_history(),
                 )
 
-            def on_pick_then_generate(prompt, negative_prompt, quality_tags, uc_preset):
+            def on_pick_then_generate(prompt, negative_prompt, quality_tags, uc_preset, ranking_mode):
                 """Generate new comparison after pick (for chaining)."""
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
-                    result = loop.run_until_complete(self.generate_new_comparison(prompt, negative_prompt, quality_tags, uc_preset))
+                    result = loop.run_until_complete(
+                        self.generate_new_comparison(
+                            prompt,
+                            negative_prompt,
+                            quality_tags,
+                            uc_preset,
+                            ranking_mode,
+                        )
+                    )
                     artists_a_text = f"**작가:** {', '.join(self.current_artists_a)}"
                     artists_b_text = f"**작가:** {', '.join(self.current_artists_b)}"
                     history_text = self.format_recent_history()
@@ -1670,10 +1896,24 @@ class ArtistELORanker:
                 history_text = self.format_recent_history()
                 return result + (artists_a_text, artists_b_text, history_text)
 
+            def on_mode_change(ranking_mode):
+                """Persist the preset without generating or resetting any ranking data."""
+                active_mode = self.artist_manager.set_ranking_mode(ranking_mode)
+                return (
+                    get_ranking_mode_description(active_mode),
+                    self.format_top_artists_display(),
+                )
+
+            ranking_mode_dropdown.change(
+                fn=on_mode_change,
+                inputs=[ranking_mode_dropdown],
+                outputs=[ranking_mode_help, leaderboard],
+            )
+
             # Auto-generate first comparison on app load
             app.load(
                 fn=on_initial_load,
-                inputs=[prompt_input, negative_prompt_input, quality_toggle, uc_preset_dropdown],
+                inputs=[prompt_input, negative_prompt_input, quality_toggle, uc_preset_dropdown, ranking_mode_dropdown],
                 outputs=[image_a, image_b, status_msg, leaderboard, result_msg, details_msg, pick_a_btn, pick_b_btn, undo_btn, artists_a_display, artists_b_display, history_display]
             )
 
@@ -1683,7 +1923,7 @@ class ArtistELORanker:
                 outputs=[result_msg, details_msg, leaderboard, pick_a_btn, pick_b_btn, undo_btn]
             ).then(
                 fn=on_pick_then_generate,
-                inputs=[prompt_input, negative_prompt_input, quality_toggle, uc_preset_dropdown],
+                inputs=[prompt_input, negative_prompt_input, quality_toggle, uc_preset_dropdown, ranking_mode_dropdown],
                 outputs=[image_a, image_b, status_msg, leaderboard, result_msg, details_msg, pick_a_btn, pick_b_btn, undo_btn, artists_a_display, artists_b_display, history_display]
             ).then(
                 fn=on_export,
@@ -1696,7 +1936,7 @@ class ArtistELORanker:
                 outputs=[result_msg, details_msg, leaderboard, pick_a_btn, pick_b_btn, undo_btn]
             ).then(
                 fn=on_pick_then_generate,
-                inputs=[prompt_input, negative_prompt_input, quality_toggle, uc_preset_dropdown],
+                inputs=[prompt_input, negative_prompt_input, quality_toggle, uc_preset_dropdown, ranking_mode_dropdown],
                 outputs=[image_a, image_b, status_msg, leaderboard, result_msg, details_msg, pick_a_btn, pick_b_btn, undo_btn, artists_a_display, artists_b_display, history_display]
             ).then(
                 fn=on_export,
@@ -1722,7 +1962,7 @@ class ArtistELORanker:
             # Skip: generate new images without any ELO changes
             skip_btn.click(
                 fn=on_pick_then_generate,
-                inputs=[prompt_input, negative_prompt_input, quality_toggle, uc_preset_dropdown],
+                inputs=[prompt_input, negative_prompt_input, quality_toggle, uc_preset_dropdown, ranking_mode_dropdown],
                 outputs=[image_a, image_b, status_msg, leaderboard, result_msg, details_msg, pick_a_btn, pick_b_btn, undo_btn, artists_a_display, artists_b_display, history_display]
             )
 
