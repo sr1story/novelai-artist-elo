@@ -11,6 +11,7 @@ A web-based blind comparison system that ranks Danbooru artist tags by generatin
 - **ELO Rating System**: Individual-based ELO calculation with zero-sum enforcement
 - **Active Pool Management**: Maintains a pool of ~150 artists for efficient ranking discovery
 - **Smart Rotation**: Low performers are probabilistically rotated out; high ELO artists are more likely to return
+- **Ranking Directions**: Switch between balanced, newcomer discovery, top-rank refinement, and fast rotation without resetting ELO data
 - **Win Rate Statistics**: Track solo, duo, and trio performance for each artist
 - **Undo Support**: Revert the last comparison if you change your mind
 - **Keyboard Shortcuts**: Quick voting with `1`, `2`, `s` (skip), and `0` (undo)
@@ -114,6 +115,24 @@ Each artist entry shows:
 - **T:67%(8)** - Trio win rate: 67% when in a group of 3 artists (8 trio comparisons)
 
 This breakdown helps identify artists who perform better alone vs. in combinations.
+
+### Ranking Direction
+
+Use the **Ranking Direction** dropdown above the comparison images to change which
+artists are more likely to appear. The ELO formula, rankings, history, and two-image
+workflow stay the same when the direction changes.
+
+| Direction | Focus |
+|-----------|-------|
+| **Balanced** | Existing behavior, with a mild preference for artists with fewer comparisons |
+| **Newcomer Discovery** | Artists with fewer than 5 comparisons and never-rated artists |
+| **Top-Rank Refinement** | The top 30% of artists that already have at least 5 comparisons |
+| **Fast Rotation** | Established artists below the active-pool average, with faster pool turnover |
+
+Specialized directions use a 70% focus / 30% balanced mixture so that the rest of
+the pool is never completely ignored. Fast rotation removes artists only from the
+active pool; it does not delete their ELO rating or comparison history. The selected
+direction is stored in `active_pool.json` and survives restarts.
 
 ### Pool Health & Statistics
 
@@ -266,7 +285,7 @@ The application creates/uses several JSON files:
 | File | Purpose |
 |------|---------|
 | `artist_elo_ratings.json` | ELO ratings and comparison counts |
-| `active_pool.json` | Current 150-artist active pool |
+| `active_pool.json` | Current active pool and selected ranking direction |
 | `comparison_history.json` | Full history of all comparisons |
 
 These files are automatically created on first run and persist your rankings across sessions.
