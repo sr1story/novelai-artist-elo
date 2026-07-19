@@ -47,6 +47,8 @@ current_comparison.json
 current_comparison.tmp
 prompt_presets.json
 prompt_presets.tmp
+temporary_pool.json
+temporary_pool.tmp
 data/
 
 # OS files
