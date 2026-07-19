@@ -200,10 +200,10 @@ RANKING_MODE_CONFIG = {
         "addition_probability": 0.15,
     },
     RANKING_MODE_NEWCOMERS: {
-        "label": "신규 탐색",
-        "description": "비교 5회 미만 작가와 아직 평가하지 않은 작가를 더 자주 보여줍니다.",
-        "removal_probability": 0.28,
-        "addition_probability": 0.28,
+        "label": "신규",
+        "description": "풀 200명 미만에서는 풀 밖 작가를 단독 비교하고, 200명부터는 교체 위험 작가를 단독 비교합니다.",
+        "removal_probability": 0.15,
+        "addition_probability": 0.15,
     },
     RANKING_MODE_TOP: {
         "label": "상위권 정밀화",
@@ -212,10 +212,10 @@ RANKING_MODE_CONFIG = {
         "addition_probability": 0.08,
     },
     RANKING_MODE_FAST_ROTATION: {
-        "label": "빠른 교체",
-        "description": "충분히 평가됐지만 평균보다 낮은 작가를 재검증하고 풀 교체를 빠르게 합니다.",
-        "removal_probability": 0.35,
-        "addition_probability": 0.35,
+        "label": "교체",
+        "description": "풀 150명 초과에서는 교체 위험 작가를 단독 비교하고, 150명 이하에서는 풀 밖 작가를 단독 비교합니다.",
+        "removal_probability": 0.15,
+        "addition_probability": 0.15,
     },
 }
 
@@ -226,6 +226,15 @@ RANKING_MODE_CHOICES = [
 MODE_FOCUS_PROBABILITY = 0.70
 MIN_CONFIDENT_COMPARISONS = 5
 TOP_ARTIST_FRACTION = 0.30
+DISCOVERY_POOL_CEILING = 200
+REPLACEMENT_POOL_FLOOR = 150
+
+POOL_ACTION_STANDARD = "standard"
+POOL_ACTION_CALIBRATE_SOLO = "calibrate_solo"
+POOL_ACTION_EXPAND_TO_200 = "expand_to_200"
+POOL_ACTION_TRIM_FROM_200 = "trim_from_200"
+POOL_ACTION_TRIM_TO_150 = "trim_to_150"
+POOL_ACTION_REFILL_FROM_150 = "refill_from_150"
 
 
 def normalize_ranking_mode(mode: str) -> str:
@@ -241,6 +250,23 @@ def get_ranking_mode_label(mode: str) -> str:
 def get_ranking_mode_description(mode: str) -> str:
     """Return the short explanation shown below the mode dropdown."""
     return RANKING_MODE_CONFIG[normalize_ranking_mode(mode)]["description"]
+
+
+def get_pool_action_status(pool_action: str) -> str:
+    """Explain why the current pair was selected."""
+    if pool_action in {
+        POOL_ACTION_EXPAND_TO_200,
+        POOL_ACTION_REFILL_FROM_150,
+    }:
+        return "풀 밖 작가 단일 비교입니다. 선택 후 두 작가가 활성 풀에 들어갑니다."
+    if pool_action in {
+        POOL_ACTION_TRIM_FROM_200,
+        POOL_ACTION_TRIM_TO_150,
+    }:
+        return "교체 후보 단일 비교입니다. 선택한 뒤 패자는 활성 풀에서 제외됩니다."
+    if pool_action == POOL_ACTION_CALIBRATE_SOLO:
+        return "교체 후보 판정을 위한 단일 비교입니다. 이번 비교에서는 풀을 교체하지 않습니다."
+    return "이미지가 생성되었습니다. 더 마음에 드는 쪽을 선택하세요."
 
 
 # --------------------------------------------------------------------------------
@@ -384,12 +410,12 @@ class ActivePool:
     Manages a smaller active pool of artists for more meaningful comparisons.
 
     Strategy:
-    - Maintain a pool of ~150 artists that get compared frequently
+    - Maintain a directional pool that can move between roughly 150 and 200
     - Winners stay in the pool (good artists get more comparisons)
     - Losers may get rotated out (with some probability)
     - Periodically introduce new random artists to discover hidden gems
     - Weight selection according to the selected ranking direction preset
-    - Keep 30% of selections on the balanced strategy to preserve coverage
+    - Use solo comparisons for deterministic newcomer and replacement modes
     """
 
     def __init__(self, all_artists: List[str], elo_system: ELOSystem,
@@ -512,6 +538,123 @@ class ActivePool:
 
         return []
 
+    def _get_at_risk_candidates(self, candidates: List[str] = None) -> List[str]:
+        """Return confident active artists below the current pool average."""
+        candidates = candidates if candidates is not None else self.pool
+        active_candidates = [artist for artist in candidates if artist in self.pool]
+        if not active_candidates or not self.pool:
+            return []
+
+        pool_average = sum(
+            self.elo_system.get_rating(artist) for artist in self.pool
+        ) / len(self.pool)
+        return [
+            artist for artist in active_candidates
+            if (
+                self.elo_system.get_artist_comparison_count(artist)
+                >= MIN_CONFIDENT_COMPARISONS
+                and self.elo_system.get_rating(artist) < pool_average
+            )
+        ]
+
+    def _get_removal_weight(self, artist: str) -> float:
+        """Return the same relative-risk weight used for pool rotation."""
+        if not self.pool:
+            return 0.0
+        pool_max_elo = max(self.elo_system.get_rating(a) for a in self.pool)
+        elo_gap = max(0.0, pool_max_elo - self.elo_system.get_rating(artist))
+        return max(1.0, (elo_gap / 100.0) ** 2)
+
+    def _select_solo_pair(
+        self,
+        candidates: List[str],
+        weights: List[float] = None,
+    ) -> Optional[Tuple[List[str], List[str]]]:
+        """Select two distinct artists and put one artist on each image."""
+        if len(candidates) < 2:
+            return None
+
+        first_weights = weights or [self.get_selection_weight(a) for a in candidates]
+        first = self._weighted_choice(candidates, first_weights)
+
+        remaining = [artist for artist in candidates if artist != first]
+        if weights is None:
+            remaining_weights = [self.get_selection_weight(a) for a in remaining]
+        else:
+            weight_by_artist = dict(zip(candidates, weights))
+            remaining_weights = [weight_by_artist[a] for a in remaining]
+        second = self._weighted_choice(remaining, remaining_weights)
+        return [first], [second]
+
+    def _select_standard_pair(self) -> Tuple[List[str], List[str], str]:
+        """Select two existing 1-3 artist combinations."""
+        artists_a = self.select_combination()
+        artists_b = self.select_combination()
+        attempts = 0
+        while set(artists_a) == set(artists_b) and attempts < 50:
+            artists_b = self.select_combination()
+            attempts += 1
+        return artists_a, artists_b, POOL_ACTION_STANDARD
+
+    def select_comparison_pair(self) -> Tuple[List[str], List[str], str]:
+        """Select a complete comparison pair using the active pool direction."""
+        if not self.pool:
+            self._refill_pool()
+
+        directional_action = None
+        directional_candidates: List[str] = []
+        directional_weights: Optional[List[float]] = None
+
+        if self.ranking_mode == RANKING_MODE_NEWCOMERS:
+            if len(self.pool) < DISCOVERY_POOL_CEILING:
+                directional_action = POOL_ACTION_EXPAND_TO_200
+                outside_pool = [a for a in self.all_artists if a not in self.pool]
+                never_rated = [a for a in outside_pool if a not in self.elo_system.ratings]
+                directional_candidates = (
+                    never_rated if len(never_rated) >= 2 else outside_pool
+                )
+            else:
+                directional_action = POOL_ACTION_TRIM_FROM_200
+                directional_candidates = self._get_at_risk_candidates()
+                directional_weights = [
+                    self._get_removal_weight(a) for a in directional_candidates
+                ]
+
+        elif self.ranking_mode == RANKING_MODE_FAST_ROTATION:
+            if len(self.pool) > REPLACEMENT_POOL_FLOOR:
+                directional_action = POOL_ACTION_TRIM_TO_150
+                directional_candidates = self._get_at_risk_candidates()
+                directional_weights = [
+                    self._get_removal_weight(a) for a in directional_candidates
+                ]
+            else:
+                directional_action = POOL_ACTION_REFILL_FROM_150
+                outside_pool = [a for a in self.all_artists if a not in self.pool]
+                never_rated = [a for a in outside_pool if a not in self.elo_system.ratings]
+                directional_candidates = (
+                    never_rated if len(never_rated) >= 2 else outside_pool
+                )
+
+        if directional_action:
+            solo_pair = self._select_solo_pair(
+                directional_candidates,
+                directional_weights,
+            )
+            if solo_pair:
+                return solo_pair[0], solo_pair[1], directional_action
+
+            # If fewer than two artists are currently safe to remove, compare
+            # under-evaluated active artists as solos until risk is measurable.
+            calibration_pair = self._select_solo_pair(self.pool)
+            if calibration_pair:
+                return (
+                    calibration_pair[0],
+                    calibration_pair[1],
+                    POOL_ACTION_CALIBRATE_SOLO,
+                )
+
+        return self._select_standard_pair()
+
     def _select_from_candidates(self, candidates: List[str]) -> str:
         """Select an artist with a 70/30 preset-to-balanced mixture."""
         selection_pool = candidates
@@ -551,7 +694,12 @@ class ActivePool:
         random.shuffle(selected)
         return selected
 
-    def process_result(self, winners: List[str], losers: List[str]) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float, bool]]]:
+    def process_result(
+        self,
+        winners: List[str],
+        losers: List[str],
+        pool_action: str = POOL_ACTION_STANDARD,
+    ) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float, bool]]]:
         """
         Process comparison result to update the pool.
         Uses weighted removal from entire pool (not just losers).
@@ -560,6 +708,46 @@ class ActivePool:
         """
         rotated_out = []  # [(artist, elo), ...]
         rotated_in = []   # [(artist, elo, is_returning), ...]
+
+        if pool_action in {
+            POOL_ACTION_EXPAND_TO_200,
+            POOL_ACTION_REFILL_FROM_150,
+        }:
+            for artist in dict.fromkeys(winners + losers):
+                if artist in self.all_artists and artist not in self.pool:
+                    self.pool.append(artist)
+                    elo = self.elo_system.get_rating(artist)
+                    is_returning = (
+                        self.elo_system.get_artist_comparison_count(artist) > 1
+                    )
+                    rotated_in.append((artist, elo, is_returning))
+                    status = "returning" if is_returning else "fresh"
+                    print(f"Added compared artist: {artist} ({status})")
+            self.save()
+            return rotated_out, rotated_in
+
+        if pool_action in {
+            POOL_ACTION_TRIM_FROM_200,
+            POOL_ACTION_TRIM_TO_150,
+        }:
+            can_remove = (
+                len(self.pool) >= DISCOVERY_POOL_CEILING
+                if pool_action == POOL_ACTION_TRIM_FROM_200
+                else len(self.pool) > REPLACEMENT_POOL_FLOOR
+            )
+            if can_remove:
+                for artist in losers:
+                    if artist in self.pool:
+                        elo = self.elo_system.get_rating(artist)
+                        self.pool.remove(artist)
+                        rotated_out.append((artist, elo))
+                        print(f"Removed compared loser: {artist} (ELO: {elo:.0f})")
+                        break
+            self.save()
+            return rotated_out, rotated_in
+
+        if pool_action == POOL_ACTION_CALIBRATE_SOLO:
+            return rotated_out, rotated_in
 
         # Determine probabilities based on pool size. Around the configured
         # target, the active direction preset controls turnover speed.
@@ -651,9 +839,12 @@ class ActivePool:
                 status = f"returning, ELO: {elo:.0f}" if is_returning else "fresh"
                 print(f"Rotated in: {new_artist} ({status})")
 
-        # Hard cap: if pool exceeds target + 20, force remove lowest performers
-        # This ensures pool size stays bounded
-        max_pool_size = self.pool_size + 20
+        # Directional modes intentionally allow the pool to move between
+        # roughly 150 and 200, while still keeping a strict upper bound.
+        max_pool_size = max(
+            self.pool_size + 20,
+            DISCOVERY_POOL_CEILING + 1,
+        )
         while len(self.pool) > max_pool_size:
             # Find artists with enough matches to judge (confidence >= 1)
             candidates = [(a, self.elo_system.get_rating(a))
@@ -787,10 +978,28 @@ class ArtistTagManager:
         num_artists = random.randint(min_artists, max_artists)
         return random.sample(self.artists, min(num_artists, len(self.artists)))
 
-    def process_result(self, winners: List[str], losers: List[str]) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float, bool]]]:
+    def get_comparison_pair(self) -> Tuple[List[str], List[str], str]:
+        """Select both sides and record how the pool should process the result."""
+        if self.active_pool:
+            return self.active_pool.select_comparison_pair()
+
+        artists_a = self.get_random_combination()
+        artists_b = self.get_random_combination()
+        attempts = 0
+        while set(artists_a) == set(artists_b) and attempts < 50:
+            artists_b = self.get_random_combination()
+            attempts += 1
+        return artists_a, artists_b, POOL_ACTION_STANDARD
+
+    def process_result(
+        self,
+        winners: List[str],
+        losers: List[str],
+        pool_action: str = POOL_ACTION_STANDARD,
+    ) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float, bool]]]:
         """Process comparison result to update the active pool. Returns (rotated_out, rotated_in)."""
         if self.active_pool:
-            return self.active_pool.process_result(winners, losers)
+            return self.active_pool.process_result(winners, losers, pool_action)
         return [], []
 
     def set_ranking_mode(self, mode: str) -> str:
@@ -962,21 +1171,12 @@ async def generate_comparison_pair(
     negative_prompt: str = None,
     quality_toggle: bool = True,
     uc_preset: int = 0
-) -> Tuple[Optional[Path], Optional[Path], List[str], List[str]]:
+) -> Tuple[Optional[Path], Optional[Path], List[str], List[str], str]:
     """
     Generate two images with different artist combinations.
-    Returns: (image_a_path, image_b_path, artists_a, artists_b)
+    Returns: (image_a_path, image_b_path, artists_a, artists_b, pool_action)
     """
-    # Get two different artist combinations (overlap is allowed, handled in ELO calc)
-    artists_a = artist_manager.get_random_combination()
-    artists_b = artist_manager.get_random_combination()
-
-    # Ensure they're not identical (but overlap is fine)
-    max_attempts = 50
-    attempts = 0
-    while set(artists_a) == set(artists_b) and attempts < max_attempts:
-        artists_b = artist_manager.get_random_combination()
-        attempts += 1
+    artists_a, artists_b, pool_action = artist_manager.get_comparison_pair()
 
     # Format artist tags
     tags_a = artist_manager.format_artist_tags(artists_a)
@@ -1000,8 +1200,8 @@ async def generate_comparison_pair(
     success_b = await generate_image(session, prompt_b, path_b, negative_prompt, quality_toggle, uc_preset)
 
     if success_a and success_b:
-        return path_a, path_b, artists_a, artists_b
-    return None, None, [], []
+        return path_a, path_b, artists_a, artists_b, pool_action
+    return None, None, [], [], POOL_ACTION_STANDARD
 
 
 # --------------------------------------------------------------------------------
@@ -1133,6 +1333,7 @@ class UndoState:
     prev_image_b: Optional[str] = None
     prev_artists_a: List[str] = field(default_factory=list)
     prev_artists_b: List[str] = field(default_factory=list)
+    prev_pool_action: str = POOL_ACTION_STANDARD
 
 
 class ArtistELORanker:
@@ -1161,6 +1362,7 @@ class ArtistELORanker:
         self.current_negative_prompt: str = ""
         self.current_quality_toggle: bool = True
         self.current_uc_preset: int = 0
+        self.current_pool_action: str = POOL_ACTION_STANDARD
 
         # Undo state
         self.last_undo_state: Optional[UndoState] = None
@@ -1216,6 +1418,9 @@ class ArtistELORanker:
             self.current_negative_prompt = str(data.get("negative_prompt", ""))
             self.current_quality_toggle = bool(data.get("quality_toggle", True))
             self.current_uc_preset = int(data.get("uc_preset", 0))
+            self.current_pool_action = str(
+                data.get("pool_action", POOL_ACTION_STANDARD)
+            )
             self.selection_made = bool(data.get("selection_made", False))
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             print(f"Could not restore current comparison: {exc}")
@@ -1235,6 +1440,7 @@ class ArtistELORanker:
             "negative_prompt": self.current_negative_prompt,
             "quality_toggle": self.current_quality_toggle,
             "uc_preset": self.current_uc_preset,
+            "pool_action": self.current_pool_action,
             "selection_made": self.selection_made,
         }
         temp_file = CURRENT_COMPARISON_FILE.with_suffix(".tmp")
@@ -1446,7 +1652,7 @@ class ArtistELORanker:
                 gr.update(interactive=False),
             )
 
-        path_a, path_b, artists_a, artists_b = await generate_comparison_pair(
+        path_a, path_b, artists_a, artists_b, pool_action = await generate_comparison_pair(
             base_prompt,
             self.artist_manager,
             session,
@@ -1461,6 +1667,7 @@ class ArtistELORanker:
             self.current_image_b = path_b
             self.current_artists_a = artists_a
             self.current_artists_b = artists_b
+            self.current_pool_action = pool_action
 
             # Reset selection state for new comparison
             # BUT keep undo state so user can still undo the previous selection!
@@ -1474,7 +1681,7 @@ class ArtistELORanker:
             return (
                 str(path_a),
                 str(path_b),
-                "이미지가 생성되었습니다. 더 마음에 드는 쪽을 선택하세요.",
+                get_pool_action_status(pool_action),
                 self.format_top_artists_display(),
                 "",  # Clear result_msg
                 "",  # Clear details_msg
@@ -1533,7 +1740,11 @@ class ArtistELORanker:
         self.elo_system.save(ELO_RATINGS_FILE)
 
         # Update active pool (rotate losers, introduce new artists)
-        rotated_out, rotated_in = self.artist_manager.process_result(winners, losers)
+        rotated_out, rotated_in = self.artist_manager.process_result(
+            winners,
+            losers,
+            self.current_pool_action,
+        )
 
         # Log rotations (most recent first)
         for artist, elo, is_returning in rotated_in:
@@ -1558,6 +1769,7 @@ class ArtistELORanker:
             prev_image_b=str(self.current_image_b) if self.current_image_b else None,
             prev_artists_a=self.current_artists_a.copy(),
             prev_artists_b=self.current_artists_b.copy(),
+            prev_pool_action=self.current_pool_action,
         )
         self.selection_made = True
         self.save_current_comparison()
@@ -1650,6 +1862,7 @@ class ArtistELORanker:
         self.current_image_b = Path(state.prev_image_b) if state.prev_image_b else None
         self.current_artists_a = state.prev_artists_a.copy()
         self.current_artists_b = state.prev_artists_b.copy()
+        self.current_pool_action = state.prev_pool_action
 
         # Clear undo state and reset selection
         self.last_undo_state = None
@@ -1659,7 +1872,7 @@ class ArtistELORanker:
         return (
             state.prev_image_a,  # image_a
             state.prev_image_b,  # image_b
-            "**선택을 되돌렸습니다.** 다시 선택하세요.",
+            f"**선택을 되돌렸습니다.** {get_pool_action_status(self.current_pool_action)}",
             self.format_top_artists_display(),
             "",  # Clear result_msg
             "",  # Clear details_msg
@@ -1832,7 +2045,8 @@ class ArtistELORanker:
 
                 can_pick = not self.selection_made
                 status = (
-                    "저장된 비교를 불러왔습니다. 더 마음에 드는 이미지를 선택하세요."
+                    "저장된 비교를 불러왔습니다. "
+                    + get_pool_action_status(self.current_pool_action)
                     if can_pick
                     else "이 비교는 이미 선택되었습니다. 건너뛰기를 눌러 다음 비교를 생성하세요."
                 )

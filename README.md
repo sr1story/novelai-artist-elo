@@ -9,9 +9,9 @@ A web-based blind comparison system that ranks Danbooru artist tags by generatin
 
 - **Blind Comparisons**: Compare two AI-generated images without seeing which artists were used (toggleable)
 - **ELO Rating System**: Individual-based ELO calculation with zero-sum enforcement
-- **Active Pool Management**: Maintains a pool of ~150 artists for efficient ranking discovery
+- **Active Pool Management**: Moves between roughly 150-200 artists for efficient discovery and replacement
 - **Smart Rotation**: Low performers are probabilistically rotated out; high ELO artists are more likely to return
-- **Ranking Directions**: Switch between balanced, newcomer discovery, top-rank refinement, and fast rotation without resetting ELO data
+- **Ranking Directions**: Switch between balanced, newcomer, top-rank refinement, and replacement workflows without resetting ELO data
 - **Win Rate Statistics**: Track solo, duo, and trio performance for each artist
 - **Undo Support**: Revert the last comparison if you change your mind
 - **Keyboard Shortcuts**: Quick voting with `1`, `2`, `s` (skip), and `0` (undo)
@@ -124,15 +124,16 @@ workflow stay the same when the direction changes.
 
 | Direction | Focus |
 |-----------|-------|
-| **Balanced** | Existing behavior, with a mild preference for artists with fewer comparisons |
-| **Newcomer Discovery** | Artists with fewer than 5 comparisons and never-rated artists |
-| **Top-Rank Refinement** | The top 30% of artists that already have at least 5 comparisons |
-| **Fast Rotation** | Established artists below the active-pool average, with faster pool turnover |
+| **Balanced** | Existing 1-3 artist combinations, with a mild preference for artists with fewer comparisons |
+| **Newcomer** | Below 200 active artists, compare two never-rated artists outside the pool as solo tags and add both after voting. At 200 or more, compare at-risk pool artists as solos and remove the loser |
+| **Top-Rank Refinement** | Focus 70% of selections on the top 30% of artists with at least 5 comparisons, while keeping 30% balanced coverage |
+| **Replacement** | Above 150 active artists, compare at-risk pool artists as solos and remove the loser. At 150 or fewer, compare two artists outside the pool as solos and add both after voting |
 
-Specialized directions use a 70% focus / 30% balanced mixture so that the rest of
-the pool is never completely ignored. Fast rotation removes artists only from the
-active pool; it does not delete their ELO rating or comparison history. The selected
-direction is stored in `active_pool.json` and survives restarts.
+If fewer than two at-risk artists have enough data, Newcomer and Replacement use
+solo calibration comparisons without changing pool membership. Removing an artist
+only removes them from the active pool; it does not delete their ELO rating or
+comparison history. The selected direction is stored in `active_pool.json` and
+survives restarts.
 
 ### Pool Health & Statistics
 
@@ -276,7 +277,8 @@ The system uses an individual-based ELO calculation:
   - Underperformance: relative to pool's best performer
 - **Addition Weight**: `(ELO - min_ELO + 100)²`
   - Squared preference for high-ELO artists
-- **Hard Cap**: Pool size stays bounded at target + 20
+- **Directional Pool Band**: Newcomer grows the pool toward 200; Replacement shrinks it toward 150
+- **Hard Cap**: The pool stays bounded at 201, allowing a two-artist addition to cross the 200 boundary once
 
 ## Data Files
 
