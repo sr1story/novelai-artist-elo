@@ -19,6 +19,7 @@ A web-based blind comparison system that ranks Danbooru artist tags by generatin
 - **NovelAI-Style Settings**: Resolution, steps, guidance, seed, sampler, Variety+, guidance rescale, noise schedule, quality tags, and UC presets
 - **Fair Pair Seeds**: Both images use the same seed in each comparison to reduce luck-based differences
 - **Prompt Presets**: Save and reload the prompt, negative prompt, and every image setting in 10 persistent slots
+- **Temporary Artist Discovery**: Extract known artist tags from pasted text and compare them without changing the active pool
 - **Anlas Balance**: Show the current NovelAI Anlas balance without external purchase links
 - **Export to CSV**: Download full leaderboard with detailed stats
 - **Comparison History**: View your last 10 comparison results
@@ -159,6 +160,21 @@ The leaderboard displays the same labels beside artists. Artists with 5-9
 comparisons below the pool average are shown as **Exploring** until they qualify
 for another label. The selected candidate rule is also stored in
 `active_pool.json` and survives restarts.
+
+### Temporary Artist Discovery
+
+Open **Temporary Artist Discovery**, then paste a comma- or newline-delimited
+artist list or prompt. The app keeps only exact matches from the bundled artist
+tag file, accepts `artist: name`, prompt-weight wrappers, and space/underscore
+variants, removes duplicates, and discards every non-artist segment.
+
+After at least two artists are recognized, start the temporary pool. Temporary
+comparisons are always solo-vs-solo for clear attribution. Votes still update the
+global ELO ratings and comparison history, but active-pool additions, removals,
+and rotations are completely disabled. Stopping the temporary pool returns future
+comparisons to the existing active pool without deleting the cleaned list or the
+currently displayed comparison. The list and enabled state are stored separately
+in `temporary_pool.json` so a mobile server restart does not lose the session.
 
 ### Pool Health & Statistics
 
@@ -336,6 +352,7 @@ The application creates/uses several JSON files:
 |------|---------|
 | `artist_elo_ratings.json` | ELO ratings and comparison counts |
 | `active_pool.json` | Current active pool, ranking direction, and candidate rule |
+| `temporary_pool.json` | Isolated pasted artist list and temporary-pool enabled state |
 | `prompt_presets.json` | Ten prompt and image-setting preset slots |
 | `current_comparison.json` | Current images, actual pair seed, and generation settings |
 | `comparison_history.json` | Full history of all comparisons |
@@ -358,6 +375,7 @@ novelai-artist-elo/
 ├── comparison_images/       # Generated images (auto-created)
 ├── artist_elo_ratings.json  # ELO data (auto-created)
 ├── active_pool.json         # Pool data (auto-created)
+├── temporary_pool.json      # Temporary discovery pool (auto-created)
 └── comparison_history.json  # History (auto-created)
 ```
 
