@@ -9,4 +9,6 @@ active_pool.json
 comparison_history.json
 current_comparison.json
 prompt_presets.json
+temporary_pool.json
+temporary_pool.tmp
 screenshots
