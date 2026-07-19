@@ -50,6 +50,7 @@ ELO_RATINGS_FILE = DATA_DIR / "artist_elo_ratings.json"
 COMPARISON_HISTORY_FILE = DATA_DIR / "comparison_history.json"
 ACTIVE_POOL_FILE = DATA_DIR / "active_pool.json"
 CURRENT_COMPARISON_FILE = DATA_DIR / "current_comparison.json"
+PROMPT_PRESETS_FILE = DATA_DIR / "prompt_presets.json"
 
 
 # --------------------------------------------------------------------------------
@@ -60,6 +61,10 @@ CURRENT_COMPARISON_FILE = DATA_DIR / "current_comparison.json"
 STEPS = int(os.getenv("NAI_STEPS", "28"))
 IMG_WIDTH = int(os.getenv("NAI_IMG_WIDTH", "1024"))
 IMG_HEIGHT = int(os.getenv("NAI_IMG_HEIGHT", "1024"))
+PROMPT_GUIDANCE = float(os.getenv("NAI_PROMPT_GUIDANCE", "5.0"))
+PROMPT_GUIDANCE_RESCALE = float(os.getenv("NAI_GUIDANCE_RESCALE", "0.0"))
+NAI_SAMPLER = os.getenv("NAI_SAMPLER", "k_euler_ancestral")
+NAI_NOISE_SCHEDULE = os.getenv("NAI_NOISE_SCHEDULE", "karras")
 
 
 # --------------------------------------------------------------------------------
