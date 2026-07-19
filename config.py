@@ -55,6 +55,7 @@ PROMPT_PRESETS_FILE = DATA_DIR / "prompt_presets.json"
 TEMPORARY_POOL_FILE = DATA_DIR / "temporary_pool.json"
 HALL_OF_FAME_POOL_FILE = DATA_DIR / "hall_of_fame_pool.json"
 HALL_OF_FAME_ELO_FILE = DATA_DIR / "hall_of_fame_elo_ratings.json"
+DEATHMATCH_POOL_FILE = DATA_DIR / "deathmatch_pool.json"
 
 
 # --------------------------------------------------------------------------------
