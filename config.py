@@ -51,6 +51,7 @@ COMPARISON_HISTORY_FILE = DATA_DIR / "comparison_history.json"
 ACTIVE_POOL_FILE = DATA_DIR / "active_pool.json"
 CURRENT_COMPARISON_FILE = DATA_DIR / "current_comparison.json"
 PROMPT_PRESETS_FILE = DATA_DIR / "prompt_presets.json"
+TEMPORARY_POOL_FILE = DATA_DIR / "temporary_pool.json"
 
 
 # --------------------------------------------------------------------------------
