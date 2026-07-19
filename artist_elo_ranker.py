@@ -594,6 +594,12 @@ RANKING_MODE_NEWCOMERS = "newcomers"
 RANKING_MODE_TOP = "top"
 RANKING_MODE_FAST_ROTATION = "fast_rotation"
 
+CANDIDATE_RULE_AUTO = "auto"
+CANDIDATE_RULE_FAMILIAR = "familiar"
+CANDIDATE_RULE_NEW = "new"
+CANDIDATE_RULE_DARK_HORSE = "dark_horse"
+CANDIDATE_RULE_PROVEN = "proven"
+
 RANKING_MODE_CONFIG = {
     RANKING_MODE_BALANCED: {
         "label": "균형 · 기존",
@@ -625,9 +631,40 @@ RANKING_MODE_CHOICES = [
     (settings["label"], mode)
     for mode, settings in RANKING_MODE_CONFIG.items()
 ]
+
+CANDIDATE_RULE_CONFIG = {
+    CANDIDATE_RULE_AUTO: {
+        "label": "전체 · 자동",
+        "description": "기존 가중치를 그대로 사용해 활성 풀 전체를 고르게 탐색합니다.",
+    },
+    CANDIDATE_RULE_FAMILIAR: {
+        "label": "친숙한",
+        "description": "비교 10회 이상으로 취향 데이터가 충분히 쌓인 작가를 약 80% 확률로 우선합니다.",
+    },
+    CANDIDATE_RULE_NEW: {
+        "label": "새로운",
+        "description": "비교 5회 미만인 작가를 약 80% 확률로 우선해 초기 ELO를 빠르게 보정합니다.",
+    },
+    CANDIDATE_RULE_DARK_HORSE: {
+        "label": "다크호스",
+        "description": "비교 5~9회이면서 활성 풀 평균 이상의 ELO를 얻은 유망 작가를 약 80% 확률로 우선합니다.",
+    },
+    CANDIDATE_RULE_PROVEN: {
+        "label": "검증된 강자",
+        "description": "비교 10회 이상이면서 활성 풀 ELO 상위 25%인 작가를 약 80% 확률로 우선합니다.",
+    },
+}
+
+CANDIDATE_RULE_CHOICES = [
+    (settings["label"], rule)
+    for rule, settings in CANDIDATE_RULE_CONFIG.items()
+]
 MODE_FOCUS_PROBABILITY = 0.70
+CANDIDATE_RULE_FOCUS_PROBABILITY = 0.80
 MIN_CONFIDENT_COMPARISONS = 5
+FAMILIAR_COMPARISONS = 10
 TOP_ARTIST_FRACTION = 0.30
+PROVEN_ARTIST_FRACTION = 0.25
 DISCOVERY_POOL_CEILING = 200
 REPLACEMENT_POOL_FLOOR = 150
 
@@ -652,6 +689,21 @@ def get_ranking_mode_label(mode: str) -> str:
 def get_ranking_mode_description(mode: str) -> str:
     """Return the short explanation shown below the mode dropdown."""
     return RANKING_MODE_CONFIG[normalize_ranking_mode(mode)]["description"]
+
+
+def normalize_candidate_rule(rule: str) -> str:
+    """Return a supported comparison-candidate rule."""
+    return rule if rule in CANDIDATE_RULE_CONFIG else CANDIDATE_RULE_AUTO
+
+
+def get_candidate_rule_label(rule: str) -> str:
+    """Return the user-facing label for a comparison-candidate rule."""
+    return CANDIDATE_RULE_CONFIG[normalize_candidate_rule(rule)]["label"]
+
+
+def get_candidate_rule_description(rule: str) -> str:
+    """Return the short explanation shown below the candidate-rule dropdown."""
+    return CANDIDATE_RULE_CONFIG[normalize_candidate_rule(rule)]["description"]
 
 
 def get_pool_action_status(pool_action: str) -> str:
@@ -827,6 +879,7 @@ class ActivePool:
         self.pool_file = pool_file or ACTIVE_POOL_FILE
         self.pool: List[str] = []
         self.ranking_mode = RANKING_MODE_BALANCED
+        self.candidate_rule = CANDIDATE_RULE_AUTO
         self.load()
 
     def load(self):
@@ -837,6 +890,9 @@ class ActivePool:
                 self.pool = data.get("pool", [])
                 self.ranking_mode = normalize_ranking_mode(
                     data.get("ranking_mode", RANKING_MODE_BALANCED)
+                )
+                self.candidate_rule = normalize_candidate_rule(
+                    data.get("candidate_rule", CANDIDATE_RULE_AUTO)
                 )
                 # Validate pool members still exist in all_artists
                 self.pool = [a for a in self.pool if a in self.all_artists]
@@ -851,6 +907,7 @@ class ActivePool:
             json.dump({
                 "pool": self.pool,
                 "ranking_mode": self.ranking_mode,
+                "candidate_rule": self.candidate_rule,
             }, f, indent=2)
 
     def set_ranking_mode(self, mode: str) -> str:
@@ -864,6 +921,18 @@ class ActivePool:
     def get_ranking_mode(self) -> str:
         """Return the active ranking direction preset."""
         return self.ranking_mode
+
+    def set_candidate_rule(self, rule: str) -> str:
+        """Set and persist the comparison-candidate rule."""
+        normalized = normalize_candidate_rule(rule)
+        if normalized != self.candidate_rule:
+            self.candidate_rule = normalized
+            self.save()
+        return self.candidate_rule
+
+    def get_candidate_rule(self) -> str:
+        """Return the active comparison-candidate rule."""
+        return self.candidate_rule
 
     def _refill_pool(self):
         """Fill pool up to pool_size with random artists not already in pool."""
@@ -884,6 +953,122 @@ class ActivePool:
         # Inverse weight: fewer comparisons = higher weight
         # Add 1 to avoid division by zero, use sqrt to dampen the effect
         return 1.0 / (1.0 + (comparisons ** 0.5))
+
+    def _get_pool_average_elo(self) -> float:
+        """Return the active pool average used by relative candidate labels."""
+        if not self.pool:
+            return DEFAULT_ELO
+        return sum(
+            self.elo_system.get_rating(artist) for artist in self.pool
+        ) / len(self.pool)
+
+    def _get_proven_elo_threshold(self) -> float:
+        """Return the cutoff for the active pool's top ELO quartile."""
+        if not self.pool:
+            return DEFAULT_ELO
+        ranked_elos = sorted(
+            (
+                self.elo_system.get_rating(artist)
+                for artist in self.pool
+            ),
+            reverse=True,
+        )
+        top_count = max(
+            1,
+            math.ceil(len(ranked_elos) * PROVEN_ARTIST_FRACTION),
+        )
+        return ranked_elos[top_count - 1]
+
+    def _get_candidate_rule_candidates(
+        self,
+        candidates: List[str],
+    ) -> List[str]:
+        """Return candidates matching the independent ELO candidate rule."""
+        rule = self.candidate_rule
+        if rule == CANDIDATE_RULE_AUTO:
+            return []
+
+        average_elo = self._get_pool_average_elo()
+        proven_threshold = self._get_proven_elo_threshold()
+        matched = []
+
+        for artist in candidates:
+            comparisons = self.elo_system.get_artist_comparison_count(artist)
+            elo = self.elo_system.get_rating(artist)
+
+            if (
+                rule == CANDIDATE_RULE_FAMILIAR
+                and comparisons >= FAMILIAR_COMPARISONS
+            ):
+                matched.append(artist)
+            elif (
+                rule == CANDIDATE_RULE_NEW
+                and comparisons < MIN_CONFIDENT_COMPARISONS
+            ):
+                matched.append(artist)
+            elif (
+                rule == CANDIDATE_RULE_DARK_HORSE
+                and MIN_CONFIDENT_COMPARISONS
+                <= comparisons
+                < FAMILIAR_COMPARISONS
+                and elo >= average_elo
+            ):
+                matched.append(artist)
+            elif (
+                rule == CANDIDATE_RULE_PROVEN
+                and comparisons >= FAMILIAR_COMPARISONS
+                and elo >= proven_threshold
+            ):
+                matched.append(artist)
+
+        return matched
+
+    def _get_candidate_rule_weights(self, candidates: List[str]) -> List[float]:
+        """Weight artists inside a selected rule without making it absolute."""
+        average_elo = self._get_pool_average_elo()
+        proven_threshold = self._get_proven_elo_threshold()
+        weights = []
+
+        for artist in candidates:
+            comparisons = self.elo_system.get_artist_comparison_count(artist)
+            elo = self.elo_system.get_rating(artist)
+
+            if self.candidate_rule == CANDIDATE_RULE_FAMILIAR:
+                weight = 1.0 + math.sqrt(max(0, comparisons))
+            elif self.candidate_rule == CANDIDATE_RULE_NEW:
+                weight = 1.0 / (1.0 + comparisons)
+            elif self.candidate_rule == CANDIDATE_RULE_DARK_HORSE:
+                elo_signal = 1.0 + max(0.0, elo - average_elo) / 50.0
+                uncertainty = 1.0 + max(
+                    0,
+                    FAMILIAR_COMPARISONS - comparisons,
+                ) / FAMILIAR_COMPARISONS
+                weight = elo_signal * uncertainty
+            elif self.candidate_rule == CANDIDATE_RULE_PROVEN:
+                elo_signal = 1.0 + max(0.0, elo - proven_threshold) / 50.0
+                experience = 1.0 + min(comparisons, 30) / 30.0
+                weight = elo_signal * experience
+            else:
+                weight = self.get_selection_weight(artist)
+
+            weights.append(weight)
+
+        return weights
+
+    def get_artist_candidate_label(self, artist: str) -> str:
+        """Classify an artist for the leaderboard using ELO and sample size."""
+        comparisons = self.elo_system.get_artist_comparison_count(artist)
+        elo = self.elo_system.get_rating(artist)
+
+        if comparisons < MIN_CONFIDENT_COMPARISONS:
+            return "새로운"
+        if comparisons < FAMILIAR_COMPARISONS:
+            if elo >= self._get_pool_average_elo():
+                return "다크호스"
+            return "탐색 중"
+        if elo >= self._get_proven_elo_threshold():
+            return "검증된 강자"
+        return "친숙한"
 
     @staticmethod
     def _weighted_choice(candidates: List[str], weights: List[float]) -> str:
@@ -1063,8 +1248,17 @@ class ActivePool:
         return self._select_standard_pair()
 
     def _select_from_candidates(self, candidates: List[str]) -> str:
-        """Select an artist with a 70/30 preset-to-balanced mixture."""
+        """Select using the candidate rule first, then the pool direction."""
         selection_pool = candidates
+        candidate_rule_pool = self._get_candidate_rule_candidates(candidates)
+        if (
+            candidate_rule_pool
+            and random.random() < CANDIDATE_RULE_FOCUS_PROBABILITY
+        ):
+            selection_pool = candidate_rule_pool
+            weights = self._get_candidate_rule_weights(selection_pool)
+            return self._weighted_choice(selection_pool, weights)
+
         if self.ranking_mode != RANKING_MODE_BALANCED:
             focus_candidates = self._get_focus_candidates(candidates)
             if focus_candidates and random.random() < MODE_FOCUS_PROBABILITY:
@@ -1297,10 +1491,19 @@ class ActivePool:
 
     def get_pool_stats(self) -> dict:
         """Get statistics about the current pool."""
+        evaluated_artists = {
+            artist
+            for artist in self.elo_system.ratings
+            if artist in self.all_artists
+        }
+        out_count = len(evaluated_artists - set(self.pool))
+
         if not self.pool:
             return {"size": 0, "avg_comparisons": 0, "avg_elo": DEFAULT_ELO,
                     "at_risk": [], "lowest_elo": [], "newcomers": 0,
-                    "safe": 0, "total_artists": 0}
+                    "safe": 0, "total_artists": len(self.all_artists),
+                    "out_count": out_count,
+                    "candidate_rule": self.candidate_rule}
 
         comparisons = [self.elo_system.get_artist_comparison_count(a) for a in self.pool]
         elos = [self.elo_system.get_rating(a) for a in self.pool]
@@ -1355,6 +1558,8 @@ class ActivePool:
             "newcomers": newcomers,
             "safe": safe,
             "ranking_mode": self.ranking_mode,
+            "candidate_rule": self.candidate_rule,
+            "out_count": out_count,
         }
 
 
@@ -1433,6 +1638,24 @@ class ArtistTagManager:
         if self.active_pool:
             return self.active_pool.get_ranking_mode()
         return RANKING_MODE_BALANCED
+
+    def set_candidate_rule(self, rule: str) -> str:
+        """Set and persist the independent comparison-candidate rule."""
+        if self.active_pool:
+            return self.active_pool.set_candidate_rule(rule)
+        return normalize_candidate_rule(rule)
+
+    def get_candidate_rule(self) -> str:
+        """Return the active comparison-candidate rule."""
+        if self.active_pool:
+            return self.active_pool.get_candidate_rule()
+        return CANDIDATE_RULE_AUTO
+
+    def get_artist_candidate_label(self, artist: str) -> str:
+        """Return the ELO/sample-size label shown beside an artist."""
+        if self.active_pool:
+            return self.active_pool.get_artist_candidate_label(artist)
+        return "새로운"
 
     def restore_artists(self, artists: List[str]):
         """Restore artists to the pool (for undo)."""
@@ -1948,9 +2171,14 @@ class ArtistELORanker:
     def format_pool_badge(self) -> str:
         stats = self.artist_manager.get_pool_stats()
         mode = get_ranking_mode_label(self.artist_manager.get_ranking_mode())
+        candidate_rule = get_candidate_rule_label(
+            self.artist_manager.get_candidate_rule()
+        )
         return (
             f"**활성 풀 {stats.get('size', 0)}명** · "
-            f"전체 {stats.get('total_artists', 0)}명 · **{mode}**"
+            f"풀 아웃 {stats.get('out_count', 0)}명 · "
+            f"전체 {stats.get('total_artists', 0)}명 · "
+            f"**{mode} / {candidate_rule}**"
         )
 
     def save_prompt_preset(
@@ -1991,7 +2219,7 @@ class ArtistELORanker:
         )
         artist_stats = self.history.get_artist_stats()
 
-        lines = ["Rank,Artist,ELO,Comparisons,Wins,Losses,WinRate,Solo_Rounds,Solo_Wins,Solo_WR,Duo_Rounds,Duo_Wins,Duo_WR,Trio_Rounds,Trio_Wins,Trio_WR"]
+        lines = ["Rank,Artist,Label,Pool_Status,ELO,Comparisons,Wins,Losses,WinRate,Solo_Rounds,Solo_Wins,Solo_WR,Duo_Rounds,Duo_Wins,Duo_WR,Trio_Rounds,Trio_Wins,Trio_WR"]
 
         for rank, (artist, rating) in enumerate(sorted_artists, 1):
             comparisons = self.elo_system.get_artist_comparison_count(artist)
@@ -2009,8 +2237,14 @@ class ArtistELORanker:
             solo_wr = (solo['wins'] / solo['rounds'] * 100) if solo['rounds'] > 0 else 0
             duo_wr = (duo['wins'] / duo['rounds'] * 100) if duo['rounds'] > 0 else 0
             trio_wr = (trio['wins'] / trio['rounds'] * 100) if trio['rounds'] > 0 else 0
+            label = self.artist_manager.get_artist_candidate_label(artist)
+            pool_status = (
+                "active"
+                if artist in self.artist_manager.active_pool.pool
+                else "out"
+            )
 
-            lines.append(f"{rank},{artist},{rating:.0f},{comparisons},{wins},{losses},{win_rate:.1f},{solo['rounds']},{solo['wins']},{solo_wr:.1f},{duo['rounds']},{duo['wins']},{duo_wr:.1f},{trio['rounds']},{trio['wins']},{trio_wr:.1f}")
+            lines.append(f"{rank},{artist},{label},{pool_status},{rating:.0f},{comparisons},{wins},{losses},{win_rate:.1f},{solo['rounds']},{solo['wins']},{solo_wr:.1f},{duo['rounds']},{duo['wins']},{duo_wr:.1f},{trio['rounds']},{trio['wins']},{trio_wr:.1f}")
 
         return "\n".join(lines)
 
@@ -2054,6 +2288,14 @@ class ArtistELORanker:
                 rounds = stats.get('rounds', 0)
                 wins = stats.get('wins', 0)
                 wr = (wins / rounds * 100) if rounds > 0 else 0
+                candidate_label = self.artist_manager.get_artist_candidate_label(
+                    artist
+                )
+                pool_suffix = (
+                    " · 풀 아웃"
+                    if artist not in self.artist_manager.active_pool.pool
+                    else ""
+                )
 
                 # Build compact W/R breakdown
                 solo = stats.get('solo', {})
@@ -2074,7 +2316,10 @@ class ArtistELORanker:
 
                 wr_breakdown = f" {' '.join(wr_parts)}" if wr_parts else ""
 
-                lines.append(f"{i}. **{artist}** {rating:.0f} — {wr:.0f}% ({rounds})")
+                lines.append(
+                    f"{i}. **{artist}** `{candidate_label}`{pool_suffix} "
+                    f"{rating:.0f} — {wr:.0f}% ({rounds})"
+                )
                 if wr_breakdown.strip():
                     lines.append(f"   {wr_breakdown.strip()}")
 
@@ -2084,8 +2329,12 @@ class ArtistELORanker:
         lines.append(f"**전체 비교:** {self.elo_system.comparison_count}  ")
         lines.append(f"**평가한 작가:** {len(self.elo_system.ratings)}  ")
         lines.append(f"**활성 풀:** {pool_stats.get('size', 0)}/{pool_stats.get('total_artists', 0)}  ")
+        lines.append(f"**풀 아웃:** {pool_stats.get('out_count', 0)}  ")
         lines.append(
             f"**평가 방향:** {get_ranking_mode_label(self.artist_manager.get_ranking_mode())}"
+        )
+        lines.append(
+            f"**후보 규칙:** {get_candidate_rule_label(self.artist_manager.get_candidate_rule())}"
         )
 
         # Pool health breakdown
@@ -2139,6 +2388,7 @@ class ArtistELORanker:
         quality_toggle: bool = True,
         uc_preset: int = 0,
         ranking_mode: str = RANKING_MODE_BALANCED,
+        candidate_rule: str = CANDIDATE_RULE_AUTO,
         resolution_key: str = "normal_square",
         steps: int = STEPS,
         guidance: float = PROMPT_GUIDANCE,
@@ -2152,6 +2402,7 @@ class ArtistELORanker:
         custom_prompt = custom_prompt or ""
         custom_negative_prompt = custom_negative_prompt or ""
         self.artist_manager.set_ranking_mode(ranking_mode)
+        self.artist_manager.set_candidate_rule(candidate_rule)
 
         try:
             settings = GenerationSettings.from_values(
@@ -2506,6 +2757,18 @@ class ArtistELORanker:
                             self.artist_manager.get_ranking_mode()
                         )
                     )
+                    candidate_rule_dropdown = gr.Dropdown(
+                        label="비교 후보 규칙",
+                        choices=CANDIDATE_RULE_CHOICES,
+                        value=self.artist_manager.get_candidate_rule(),
+                        interactive=True,
+                    )
+                    candidate_rule_help = gr.Markdown(
+                        get_candidate_rule_description(
+                            self.artist_manager.get_candidate_rule()
+                        )
+                        + " 풀 증감이 필요한 신규·교체 라운드는 기존 운영 규칙이 우선합니다."
+                    )
 
                     with gr.Accordion("Image Settings", open=False):
                         with gr.Column(elem_id="nai-settings-panel"):
@@ -2722,6 +2985,7 @@ class ArtistELORanker:
                 quality_toggle,
                 uc_preset_dropdown,
                 ranking_mode_dropdown,
+                candidate_rule_dropdown,
                 resolution_dropdown,
                 steps_slider,
                 guidance_slider,
@@ -2755,6 +3019,7 @@ class ArtistELORanker:
                 quality_tags,
                 uc_preset,
                 ranking_mode,
+                candidate_rule,
                 resolution_key,
                 steps,
                 guidance,
@@ -2774,6 +3039,7 @@ class ArtistELORanker:
                             quality_tags,
                             uc_preset,
                             ranking_mode,
+                            candidate_rule,
                             resolution_key,
                             steps,
                             guidance,
@@ -2798,6 +3064,7 @@ class ArtistELORanker:
                 quality_tags,
                 uc_preset,
                 ranking_mode,
+                candidate_rule,
                 resolution_key,
                 steps,
                 guidance,
@@ -2809,6 +3076,7 @@ class ArtistELORanker:
             ):
                 """Reuse a saved pair on refresh; only generate when none exists."""
                 self.artist_manager.set_ranking_mode(ranking_mode)
+                self.artist_manager.set_candidate_rule(candidate_rule)
                 has_saved_pair = (
                     self.current_image_a
                     and self.current_image_b
@@ -2824,6 +3092,7 @@ class ArtistELORanker:
                         quality_tags,
                         uc_preset,
                         ranking_mode,
+                        candidate_rule,
                         resolution_key,
                         steps,
                         guidance,
@@ -2871,6 +3140,7 @@ class ArtistELORanker:
                 quality_tags,
                 uc_preset,
                 ranking_mode,
+                candidate_rule,
                 resolution_key,
                 steps,
                 guidance,
@@ -2891,6 +3161,7 @@ class ArtistELORanker:
                             quality_tags,
                             uc_preset,
                             ranking_mode,
+                            candidate_rule,
                             resolution_key,
                             steps,
                             guidance,
@@ -2946,6 +3217,16 @@ class ArtistELORanker:
                 active_mode = self.artist_manager.set_ranking_mode(ranking_mode)
                 return (
                     get_ranking_mode_description(active_mode),
+                    self.format_top_artists_display(),
+                    self.format_pool_badge(),
+                )
+
+            def on_candidate_rule_change(candidate_rule):
+                """Persist the ELO candidate rule without generating a new pair."""
+                active_rule = self.artist_manager.set_candidate_rule(candidate_rule)
+                return (
+                    get_candidate_rule_description(active_rule)
+                    + " 풀 증감이 필요한 신규·교체 라운드는 기존 운영 규칙이 우선합니다.",
                     self.format_top_artists_display(),
                     self.format_pool_badge(),
                 )
@@ -3085,6 +3366,12 @@ class ArtistELORanker:
                 fn=on_mode_change,
                 inputs=[ranking_mode_dropdown],
                 outputs=[ranking_mode_help, leaderboard, pool_badge],
+            )
+
+            candidate_rule_dropdown.change(
+                fn=on_candidate_rule_change,
+                inputs=[candidate_rule_dropdown],
+                outputs=[candidate_rule_help, leaderboard, pool_badge],
             )
 
             resolution_dropdown.change(
