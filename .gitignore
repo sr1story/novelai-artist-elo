@@ -55,6 +55,8 @@ hall_of_fame_elo_ratings.json
 hall_of_fame_elo_ratings.tmp
 weighted_comparison.json
 weighted_comparison.tmp
+deathmatch_pool.json
+deathmatch_pool.tmp
 data/
 
 # OS files

@@ -49,6 +49,7 @@ from config import (
     TEMPORARY_POOL_FILE,
     HALL_OF_FAME_POOL_FILE,
     HALL_OF_FAME_ELO_FILE,
+    DEATHMATCH_POOL_FILE,
     STEPS,
     IMG_WIDTH,
     IMG_HEIGHT,
@@ -523,6 +524,16 @@ MOBILE_CSS = """
     font-size: 1.35rem !important;
 }
 
+.deathmatch-action-row {
+    gap: .55rem !important;
+    margin-top: .45rem;
+}
+
+.deathmatch-action-row button {
+    min-height: 48px;
+    font-weight: 750;
+}
+
 .comparison-image img {
     width: 100% !important;
     height: auto !important;
@@ -628,6 +639,7 @@ RANKING_MODE_BALANCED = "balanced"
 RANKING_MODE_NEWCOMERS = "newcomers"
 RANKING_MODE_TOP = "top"
 RANKING_MODE_FAST_ROTATION = "fast_rotation"
+RANKING_MODE_BOTTOM = "bottom"
 
 CANDIDATE_RULE_AUTO = "auto"
 CANDIDATE_RULE_FAMILIAR = "familiar"
@@ -637,8 +649,8 @@ CANDIDATE_RULE_PROVEN = "proven"
 
 RANKING_MODE_CONFIG = {
     RANKING_MODE_BALANCED: {
-        "label": "균형 · 기존",
-        "description": "기존 방식입니다. 비교 횟수가 적은 작가를 완만하게 우선합니다.",
+        "label": "기본",
+        "description": "활성 풀 전체에서 비교 횟수가 적은 작가를 완만하게 우선합니다.",
         "removal_probability": 0.15,
         "addition_probability": 0.15,
     },
@@ -649,7 +661,7 @@ RANKING_MODE_CONFIG = {
         "addition_probability": 0.15,
     },
     RANKING_MODE_TOP: {
-        "label": "상위권 정밀화",
+        "label": "상위권 대결",
         "description": "비교 5회 이상인 상위 30% 작가를 더 자주 비교합니다.",
         "removal_probability": 0.08,
         "addition_probability": 0.08,
@@ -660,11 +672,25 @@ RANKING_MODE_CONFIG = {
         "removal_probability": 0.15,
         "addition_probability": 0.15,
     },
+    RANKING_MODE_BOTTOM: {
+        "label": "하위권 대결",
+        "description": "비교 5회 이상인 하위 30% 작가를 더 자주 비교합니다.",
+        "removal_probability": 0.15,
+        "addition_probability": 0.15,
+    },
 }
 
 RANKING_MODE_CHOICES = [
     (settings["label"], mode)
     for mode, settings in RANKING_MODE_CONFIG.items()
+]
+
+# The mobile UI intentionally exposes only the three straightforward views.
+# Legacy values remain loadable so existing active_pool.json files are safe.
+RANKING_VIEW_MODE_CHOICES = [
+    ("기본", RANKING_MODE_BALANCED),
+    ("상위권 대결", RANKING_MODE_TOP),
+    ("하위권 대결", RANKING_MODE_BOTTOM),
 ]
 
 CANDIDATE_RULE_CONFIG = {
@@ -699,6 +725,7 @@ CANDIDATE_RULE_FOCUS_PROBABILITY = 0.80
 MIN_CONFIDENT_COMPARISONS = 5
 FAMILIAR_COMPARISONS = 10
 TOP_ARTIST_FRACTION = 0.30
+BOTTOM_ARTIST_FRACTION = 0.30
 PROVEN_ARTIST_FRACTION = 0.25
 DISCOVERY_POOL_CEILING = 200
 REPLACEMENT_POOL_FLOOR = 150
@@ -713,6 +740,7 @@ POOL_ACTION_TEMPORARY = "temporary_pool"
 
 POOL_CONTEXT_MAIN = "main"
 POOL_CONTEXT_HALL = "hall_of_fame"
+POOL_CONTEXT_DEATHMATCH = "deathmatch"
 COMPARISON_MODE_NORMAL = "normal"
 COMPARISON_MODE_SOLO = "solo"
 COMPARISON_MODE_WEIGHTED = "weighted"
@@ -720,6 +748,7 @@ COMPARISON_MODE_WEIGHTED = "weighted"
 POOL_CONTEXT_CHOICES = [
     ("전체 작가 풀", POOL_CONTEXT_MAIN),
     ("명예의 전당", POOL_CONTEXT_HALL),
+    ("단일 데스매치", POOL_CONTEXT_DEATHMATCH),
 ]
 HALL_MODE_CHOICES = [
     ("일반 조합 · 1~3명", COMPARISON_MODE_NORMAL),
@@ -1088,6 +1117,7 @@ class ActivePool:
         self.pool: List[str] = []
         self.manual_excluded = set()
         self.hall_of_fame = set()
+        self.deathmatch = set()
         self.ranking_mode = RANKING_MODE_BALANCED
         self.candidate_rule = CANDIDATE_RULE_AUTO
         self.load()
@@ -1157,7 +1187,7 @@ class ActivePool:
 
     def _refill_pool(self):
         """Fill pool up to pool_size with random artists not already in pool."""
-        blocked = self.manual_excluded | self.hall_of_fame
+        blocked = self.manual_excluded | self.hall_of_fame | self.deathmatch
         available = [
             artist
             for artist in self.all_artists
@@ -1178,6 +1208,21 @@ class ActivePool:
         self.pool = [
             artist for artist in self.pool
             if artist not in self.hall_of_fame
+        ]
+        if refill and len(self.pool) < self.pool_size:
+            self._refill_pool()
+        else:
+            self.save()
+
+    def set_deathmatch(self, artists: List[str], refill: bool = True):
+        """Keep pending deathmatch artists out of automatic main sampling."""
+        self.deathmatch = {
+            artist for artist in artists if artist in self.all_artists
+        }
+        self.manual_excluded.update(self.deathmatch)
+        self.pool = [
+            artist for artist in self.pool
+            if artist not in self.deathmatch
         ]
         if refill and len(self.pool) < self.pool_size:
             self._refill_pool()
@@ -1208,7 +1253,11 @@ class ActivePool:
         """Explicitly add known artists to the main pool."""
         added = []
         for artist in dict.fromkeys(artists):
-            if artist not in self.all_artists or artist in self.hall_of_fame:
+            if (
+                artist not in self.all_artists
+                or artist in self.hall_of_fame
+                or artist in self.deathmatch
+            ):
                 continue
             if clear_exclusion:
                 self.manual_excluded.discard(artist)
@@ -1392,6 +1441,16 @@ class ActivePool:
                 reverse=True,
             )[:top_count]
 
+        if self.ranking_mode == RANKING_MODE_BOTTOM:
+            bottom_count = max(
+                1,
+                math.ceil(len(confident) * BOTTOM_ARTIST_FRACTION),
+            )
+            return sorted(
+                confident,
+                key=lambda artist: self.elo_system.get_rating(artist),
+            )[:bottom_count]
+
         if self.ranking_mode == RANKING_MODE_FAST_ROTATION:
             pool_average = sum(
                 self.elo_system.get_rating(artist) for artist in self.pool
@@ -1482,7 +1541,11 @@ class ActivePool:
         if self.ranking_mode == RANKING_MODE_NEWCOMERS:
             if len(self.pool) < DISCOVERY_POOL_CEILING:
                 directional_action = POOL_ACTION_EXPAND_TO_200
-                outside_pool = [a for a in self.all_artists if a not in self.pool]
+                blocked = self.manual_excluded | self.hall_of_fame | self.deathmatch
+                outside_pool = [
+                    a for a in self.all_artists
+                    if a not in self.pool and a not in blocked
+                ]
                 never_rated = [a for a in outside_pool if a not in self.elo_system.ratings]
                 directional_candidates = (
                     never_rated if len(never_rated) >= 2 else outside_pool
@@ -1500,7 +1563,11 @@ class ActivePool:
                 directional_candidates = self._get_lowest_elo_candidates(2)
             else:
                 directional_action = POOL_ACTION_REFILL_FROM_150
-                outside_pool = [a for a in self.all_artists if a not in self.pool]
+                blocked = self.manual_excluded | self.hall_of_fame | self.deathmatch
+                outside_pool = [
+                    a for a in self.all_artists
+                    if a not in self.pool and a not in blocked
+                ]
                 never_rated = [a for a in outside_pool if a not in self.elo_system.ratings]
                 directional_candidates = (
                     never_rated if len(never_rated) >= 2 else outside_pool
@@ -1690,7 +1757,7 @@ class ActivePool:
         # Maybe introduce new artist, weighted by ELO (squared for stronger preference)
         # Higher ELO = much higher chance of being added back
         if random.random() < addition_prob:
-            blocked = self.manual_excluded | self.hall_of_fame
+            blocked = self.manual_excluded | self.hall_of_fame | self.deathmatch
             available = [
                 artist
                 for artist in self.all_artists
@@ -1768,6 +1835,7 @@ class ActivePool:
                 artist not in self.pool
                 and artist in self.all_artists
                 and artist not in self.hall_of_fame
+                and artist not in self.deathmatch
             ):
                 self.manual_excluded.discard(artist)
                 self.pool.append(artist)
@@ -1794,9 +1862,14 @@ class ActivePool:
             for artist in self.elo_system.ratings
             if artist in self.all_artists
         }
-        out_count = len(
-            evaluated_artists - set(self.pool) - self.hall_of_fame
+        active_members = set(self.pool)
+        pending_or_hall = self.hall_of_fame | self.deathmatch
+        out_artists = (
+            evaluated_artists - active_members - pending_or_hall
+        ) | (
+            self.manual_excluded - pending_or_hall
         )
+        out_count = len(out_artists)
 
         if not self.pool:
             return {"size": 0, "avg_comparisons": 0, "avg_elo": DEFAULT_ELO,
@@ -2052,6 +2125,90 @@ class HallOfFamePool:
             ),
             "comparisons": self.elo_system.comparison_count,
         }
+
+
+class DeathmatchPool:
+    """Persistent single-artist review queue fed by the broken-heart action."""
+
+    def __init__(
+        self,
+        all_artists: List[str],
+        main_pool: ActivePool,
+        pool_file: Path = None,
+    ):
+        self.all_artists = all_artists
+        self._artist_set = set(all_artists)
+        self.main_pool = main_pool
+        self.pool_file = pool_file or DEATHMATCH_POOL_FILE
+        self.artists: List[str] = []
+        self.load()
+        self.main_pool.set_deathmatch(self.artists)
+
+    def load(self):
+        if not self.pool_file.exists():
+            return
+        try:
+            with open(self.pool_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            raw_artists = data.get("artists", []) if isinstance(data, dict) else []
+            self.artists = list(dict.fromkeys(
+                artist
+                for artist in raw_artists
+                if artist in self._artist_set
+            ))
+        except (OSError, TypeError, json.JSONDecodeError) as exc:
+            print(f"Could not restore deathmatch pool: {exc}")
+
+    def save(self):
+        self.pool_file.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = self.pool_file.with_suffix(".tmp")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "artists": self.artists}, f, indent=2)
+        temp_file.replace(self.pool_file)
+
+    def enqueue(self, artists: List[str]) -> List[str]:
+        """Move artists out of active sampling and into the review queue."""
+        queued = []
+        for artist in dict.fromkeys(artists):
+            if (
+                artist not in self._artist_set
+                or artist in self.artists
+                or artist in self.main_pool.hall_of_fame
+            ):
+                continue
+            self.artists.append(artist)
+            queued.append(artist)
+        if queued:
+            self.main_pool.remove_artists(queued, permanent=True)
+            self.main_pool.set_deathmatch(self.artists)
+            self.save()
+        return queued
+
+    def resolve(self, artist: str, keep: bool) -> bool:
+        """Resolve one candidate: UP returns to main; DOWN leaves them out."""
+        if artist not in self.artists:
+            return False
+        self.artists.remove(artist)
+        self.main_pool.set_deathmatch(self.artists, refill=False)
+        if keep:
+            self.main_pool.add_artists([artist], clear_exclusion=True)
+        else:
+            self.main_pool.manual_excluded.add(artist)
+            self.main_pool.save()
+        self.save()
+        return True
+
+    def select_pair(self) -> Tuple[List[str], List[str]]:
+        """Return one or two independent solo candidates for UP/DOWN review."""
+        if not self.artists:
+            raise ValueError(
+                "단일 데스매치 대기 작가가 없습니다. 전체 풀에서 깨진 하트를 누르세요."
+            )
+        selected = random.sample(self.artists, min(2, len(self.artists)))
+        return [selected[0]], ([selected[1]] if len(selected) > 1 else [])
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {"size": len(self.artists)}
 
 class ArtistTagManager:
     """Manages loading and selecting artist tags."""
@@ -2357,7 +2514,7 @@ class ArtistTagManager:
     ) -> Tuple[List[str], List[str], str]:
         """Return normal combinations that each contain a temporary artist."""
         blocked = (
-            self.active_pool.hall_of_fame
+            self.active_pool.hall_of_fame | self.active_pool.deathmatch
             if self.active_pool
             else set()
         )
@@ -2461,7 +2618,10 @@ class ArtistTagManager:
             if len([
                 artist for artist in self.temporary_pool
                 if not self.active_pool
-                or artist not in self.active_pool.hall_of_fame
+                or artist not in (
+                    self.active_pool.hall_of_fame
+                    | self.active_pool.deathmatch
+                )
             ]) < 2:
                 self.temporary_pool_enabled = False
             self.save_temporary_pool()
@@ -2772,6 +2932,48 @@ async def generate_selected_comparison_pair(
     return None, None
 
 
+async def generate_deathmatch_pair(
+    base_prompt: str,
+    artist_manager: ArtistTagManager,
+    session: ApiCredential,
+    output_dir: Path,
+    settings: GenerationSettings,
+    pair_seed: int,
+    artists_a: List[str],
+    artists_b: List[str],
+    negative_prompt: str = None,
+) -> Tuple[Optional[Path], Optional[Path]]:
+    """Generate one image per pending solo candidate, allowing an odd final entry."""
+    timestamp = int(time.time() * 1000)
+
+    async def generate_side(
+        side: str,
+        artists: List[str],
+    ) -> Optional[Path]:
+        if not artists:
+            return None
+        tags = artist_manager.format_artist_tags(artists)
+        prompt = insert_artist_tags(base_prompt, tags)
+        path = output_dir / f"deathmatch_{timestamp}_{side.lower()}.png"
+        success = await generate_image(
+            session,
+            prompt,
+            path,
+            settings,
+            pair_seed,
+            negative_prompt,
+        )
+        return path if success else None
+
+    path_a = await generate_side("A", artists_a)
+    if not path_a:
+        return None, None
+    path_b = await generate_side("B", artists_b)
+    if artists_b and not path_b:
+        return None, None
+    return path_a, path_b
+
+
 # --------------------------------------------------------------------------------
 # Comparison History
 # --------------------------------------------------------------------------------
@@ -2958,12 +3160,14 @@ class ArtistELORanker:
         self.artist_manager = ArtistTagManager(ARTIST_TAGS_FILE)
         # Initialize the active pool with ELO system
         self.artist_manager.initialize_pool(self.elo_system)
-        # The simplified main ranking always uses the original balanced logic.
-        self.artist_manager.set_ranking_mode(RANKING_MODE_BALANCED)
         self.artist_manager.set_candidate_rule(CANDIDATE_RULE_AUTO)
         self.hall_pool = HallOfFamePool(
             self.artist_manager.artists,
             self.hall_elo_system,
+            self.artist_manager.active_pool,
+        )
+        self.deathmatch_pool = DeathmatchPool(
+            self.artist_manager.artists,
             self.artist_manager.active_pool,
         )
         self.history = ComparisonHistory(COMPARISON_HISTORY_FILE)
@@ -3041,8 +3245,14 @@ class ArtistELORanker:
             image_b = self._load_image_path(data.get("image_b", ""))
             artists_a = data.get("artists_a", [])
             artists_b = data.get("artists_b", [])
+            pool_context = str(data.get("pool_context", POOL_CONTEXT_MAIN))
 
-            if not image_a or not image_b or not artists_a or not artists_b:
+            if not image_a or not artists_a:
+                return
+            if (
+                pool_context != POOL_CONTEXT_DEATHMATCH
+                and (not image_b or not artists_b)
+            ):
                 return
 
             self.current_image_a = image_a
@@ -3068,12 +3278,11 @@ class ArtistELORanker:
             self.current_pool_action = str(
                 data.get("pool_action", POOL_ACTION_STANDARD)
             )
-            self.current_pool_context = str(
-                data.get("pool_context", POOL_CONTEXT_MAIN)
-            )
+            self.current_pool_context = pool_context
             if self.current_pool_context not in {
                 POOL_CONTEXT_MAIN,
                 POOL_CONTEXT_HALL,
+                POOL_CONTEXT_DEATHMATCH,
             }:
                 self.current_pool_context = POOL_CONTEXT_MAIN
             self.current_comparison_mode = str(
@@ -3097,12 +3306,17 @@ class ArtistELORanker:
 
     def save_current_comparison(self):
         """Persist the current pair and form settings atomically."""
-        if not self.current_image_a or not self.current_image_b:
+        if not self.current_image_a:
+            return
+        if (
+            self.current_pool_context != POOL_CONTEXT_DEATHMATCH
+            and not self.current_image_b
+        ):
             return
 
         data = {
             "image_a": str(self.current_image_a),
-            "image_b": str(self.current_image_b),
+            "image_b": str(self.current_image_b) if self.current_image_b else "",
             "artists_a": self.current_artists_a,
             "artists_b": self.current_artists_b,
             "processed_prompt": self.current_prompt,
@@ -3217,15 +3431,17 @@ class ArtistELORanker:
     ) -> str:
         stats = self.artist_manager.get_pool_stats()
         hall_stats = self.hall_pool.get_stats()
+        deathmatch_stats = self.deathmatch_pool.get_stats()
         temporary = self.artist_manager.get_temporary_pool_stats()
-        selected = (
-            "명예의 전당"
-            if pool_context == POOL_CONTEXT_HALL
-            else "전체 작가 풀"
-        )
+        selected = {
+            POOL_CONTEXT_MAIN: "전체 작가 풀",
+            POOL_CONTEXT_HALL: "명예의 전당",
+            POOL_CONTEXT_DEATHMATCH: "단일 데스매치",
+        }.get(pool_context, "전체 작가 풀")
         return (
             f"**{selected}** · 전체 풀 {stats.get('size', 0)}명 · "
             f"명예의 전당 {hall_stats['size']}명 · "
+            f"데스매치 {deathmatch_stats['size']}명 · "
             f"풀 아웃 {stats.get('out_count', 0)}명 · "
             f"임시 대기 {temporary['size']}명"
         )
@@ -3304,6 +3520,7 @@ class ArtistELORanker:
             for rank, artist in enumerate(sorted_artists, 1)
         }
         hall_members = set(self.hall_pool.artists)
+        deathmatch_members = set(self.deathmatch_pool.artists)
         main_members = set(self.artist_manager.active_pool.pool)
         for artist in sorted_artists:
             stats = artist_stats.get(artist, {})
@@ -3321,6 +3538,7 @@ class ArtistELORanker:
             )
             pool_status = (
                 "hall_of_fame" if artist in hall_members
+                else "deathmatch" if artist in deathmatch_members
                 else "main" if artist in main_members
                 else "out"
             )
@@ -3384,14 +3602,18 @@ class ArtistELORanker:
     ) -> str:
         """Format the selected pool's own ELO leaderboard."""
         is_hall = pool_context == POOL_CONTEXT_HALL
+        is_deathmatch = pool_context == POOL_CONTEXT_DEATHMATCH
         elo_system = (
             getattr(self, "hall_elo_system", ELOSystem())
             if is_hall
             else self.elo_system
         )
         hall_pool = getattr(self, "hall_pool", None)
+        deathmatch_pool = getattr(self, "deathmatch_pool", None)
         if is_hall:
             members = hall_pool.artists if hall_pool else []
+        elif is_deathmatch:
+            members = deathmatch_pool.artists if deathmatch_pool else []
         else:
             members = self.artist_manager.active_pool.pool
         ranked = sorted(
@@ -3399,12 +3621,20 @@ class ArtistELORanker:
             key=lambda artist: elo_system.get_rating(artist),
             reverse=True,
         )[:30]
-        title = "명예의 전당 랭킹" if is_hall else "전체 작가 풀 랭킹"
+        title = (
+            "명예의 전당 랭킹"
+            if is_hall
+            else "단일 데스매치 대기"
+            if is_deathmatch
+            else "전체 작가 풀 랭킹"
+        )
         lines = [f"## {title}", ""]
         if not ranked:
             lines.append(
                 "명예의 전당에 작가를 먼저 추가하세요."
                 if is_hall
+                else "대기 중인 작가가 없습니다."
+                if is_deathmatch
                 else "아직 랭킹에 표시할 작가가 없습니다."
             )
         for rank, artist in enumerate(ranked, 1):
@@ -3425,6 +3655,10 @@ class ArtistELORanker:
         lines.append(f"**비교:** {elo_system.comparison_count}회  ")
         lines.append(f"**전체 풀:** {pool_stats.get('size', 0)}명  ")
         lines.append(f"**명예의 전당:** {hall_stats['size']}명  ")
+        lines.append(
+            f"**데스매치 대기:** "
+            f"{deathmatch_pool.get_stats()['size'] if deathmatch_pool else 0}명  "
+        )
         lines.append(f"**풀 아웃:** {pool_stats.get('out_count', 0)}명")
         temporary = self.artist_manager.get_temporary_pool_stats()
         if temporary["enabled"] and not is_hall:
@@ -3457,7 +3691,11 @@ class ArtistELORanker:
         custom_negative_prompt = custom_negative_prompt or ""
         pool_context = (
             pool_context
-            if pool_context in {POOL_CONTEXT_MAIN, POOL_CONTEXT_HALL}
+            if pool_context in {
+                POOL_CONTEXT_MAIN,
+                POOL_CONTEXT_HALL,
+                POOL_CONTEXT_DEATHMATCH,
+            }
             else POOL_CONTEXT_MAIN
         )
         hall_mode = (
@@ -3516,6 +3754,9 @@ class ArtistELORanker:
         self.current_uc_preset = settings.uc_preset
         self.current_pair_seed = settings.seed or random.randint(1, MAX_SEED)
 
+        if pool_context == POOL_CONTEXT_MAIN:
+            self.artist_manager.set_ranking_mode(ranking_mode)
+
         try:
             session = self.get_session()
         except ValueError:
@@ -3555,6 +3796,20 @@ class ArtistELORanker:
                     filename_prefix="hall",
                 )
                 pool_action = POOL_ACTION_STANDARD
+            elif pool_context == POOL_CONTEXT_DEATHMATCH:
+                artists_a, artists_b = self.deathmatch_pool.select_pair()
+                path_a, path_b = await generate_deathmatch_pair(
+                    base_prompt,
+                    self.artist_manager,
+                    session,
+                    COMPARISON_IMAGES_DIR,
+                    settings,
+                    self.current_pair_seed,
+                    artists_a,
+                    artists_b,
+                    negative_prompt,
+                )
+                pool_action = POOL_ACTION_STANDARD
             else:
                 (
                     path_a,
@@ -3588,7 +3843,9 @@ class ArtistELORanker:
 
         await self.refresh_anlas_balance()
 
-        if path_a and path_b:
+        if path_a and (
+            path_b or pool_context == POOL_CONTEXT_DEATHMATCH
+        ):
             self.current_image_a = path_a
             self.current_image_b = path_b
             self.current_artists_a = artists_a
@@ -3598,6 +3855,8 @@ class ArtistELORanker:
             self.current_comparison_mode = (
                 hall_mode
                 if pool_context == POOL_CONTEXT_HALL
+                else COMPARISON_MODE_SOLO
+                if pool_context == POOL_CONTEXT_DEATHMATCH
                 else COMPARISON_MODE_NORMAL
             )
             self.current_weights_a = []
@@ -3611,17 +3870,25 @@ class ArtistELORanker:
             self.save_current_comparison()
 
             # Undo is available if we have a previous state to restore
-            can_undo = self.last_undo_state is not None
+            can_undo = (
+                self.last_undo_state is not None
+                and pool_context != POOL_CONTEXT_DEATHMATCH
+            )
 
             return (
                 str(path_a),
-                str(path_b),
+                str(path_b) if path_b else None,
                 (
                     "명예의 전당 단일 작가 비교입니다."
                     if pool_context == POOL_CONTEXT_HALL
                     and hall_mode == COMPARISON_MODE_SOLO
                     else "명예의 전당 일반 조합 비교입니다."
                     if pool_context == POOL_CONTEXT_HALL
+                    else (
+                        "단일 데스매치입니다. 각 작가를 UP 또는 DOWN으로 "
+                        "개별 판정하세요."
+                    )
+                    if pool_context == POOL_CONTEXT_DEATHMATCH
                     else get_pool_action_status(pool_action)
                 ),
                 self.format_pool_badge(pool_context),
@@ -3629,8 +3896,14 @@ class ArtistELORanker:
                 self.format_top_artists_display(pool_context),
                 "",  # Clear result_msg
                 "",  # Clear details_msg
-                gr.update(interactive=True),   # Enable pick_a
-                gr.update(interactive=True),   # Enable pick_b
+                gr.update(
+                    interactive=pool_context != POOL_CONTEXT_DEATHMATCH,
+                    visible=pool_context != POOL_CONTEXT_DEATHMATCH,
+                ),
+                gr.update(
+                    interactive=pool_context != POOL_CONTEXT_DEATHMATCH,
+                    visible=pool_context != POOL_CONTEXT_DEATHMATCH,
+                ),
                 gr.update(interactive=can_undo),  # Undo available if we have state
             )
         else:
@@ -3670,6 +3943,15 @@ class ArtistELORanker:
             if pool_context == POOL_CONTEXT_HALL
             else ELO_RATINGS_FILE
         )
+        if pool_context == POOL_CONTEXT_DEATHMATCH:
+            return (
+                "단일 데스매치에서는 각 이미지의 UP/DOWN 버튼을 사용하세요.",
+                "",
+                self.format_top_artists_display(pool_context),
+                gr.update(interactive=False, visible=False),
+                gr.update(interactive=False, visible=False),
+                gr.update(interactive=False),
+            )
         if not self.current_artists_a or not self.current_artists_b:
             return (
                 "진행 중인 비교가 없습니다. 먼저 이미지를 생성하세요.",
@@ -4005,6 +4287,8 @@ class ArtistELORanker:
         )
         if not artists:
             return "진행 중인 비교가 없습니다.", False
+        if self.current_pool_context == POOL_CONTEXT_DEATHMATCH:
+            return "단일 데스매치에서는 UP/DOWN으로 판정하세요.", False
 
         in_hall = all(artist in self.hall_pool.artists for artist in artists)
         if self.current_pool_context == POOL_CONTEXT_HALL or in_hall:
@@ -4042,7 +4326,7 @@ class ArtistELORanker:
         )
 
     def apply_broken_heart(self, side: str) -> Tuple[str, bool]:
-        """Explicitly remove a main-pool combination from future sampling."""
+        """Move a main-pool combination into single-artist deathmatch review."""
         side = "A" if side == "A" else "B"
         if self.current_pool_context != POOL_CONTEXT_MAIN:
             return "명예의 전당에서는 깨진 하트를 사용할 수 없습니다.", False
@@ -4053,15 +4337,71 @@ class ArtistELORanker:
         )
         if not artists:
             return "진행 중인 비교가 없습니다.", False
-        self.artist_manager.active_pool.remove_artists(artists, permanent=True)
-        self._remove_temporary_entries(artists)
-        self.current_side_actions[side] = "removed"
+        queued = self.deathmatch_pool.enqueue(artists)
+        if not queued:
+            return "이미 데스매치로 이동했거나 이동할 작가가 없습니다.", False
+        self._remove_temporary_entries(queued)
+        self.current_side_actions[side] = "deathmatch"
         self.selection_made = True
         self.save_current_comparison()
         return (
-            f"**{side} 조합 {len(set(artists))}명**을 전체 풀에서 제외했습니다.",
+            f"**{side} 조합 {len(queued)}명**을 단일 데스매치로 보냈습니다. "
+            "기존 전체 풀 ELO는 그대로 보존됩니다.",
             True,
         )
+
+    def apply_deathmatch_decision(
+        self,
+        side: str,
+        keep: bool,
+    ) -> Tuple[str, bool]:
+        """Apply an independent UP/DOWN verdict to one displayed solo artist."""
+        side = "A" if side == "A" else "B"
+        if self.current_pool_context != POOL_CONTEXT_DEATHMATCH:
+            return "단일 데스매치 화면에서만 사용할 수 있습니다.", False
+        artists = (
+            self.current_artists_a
+            if side == "A"
+            else self.current_artists_b
+        )
+        if not artists:
+            return f"{side}에 판정할 작가가 없습니다.", False
+        if self.current_side_actions.get(side) in {"up", "down"}:
+            return f"{side} 작가는 이미 판정했습니다.", False
+
+        artist = artists[0]
+        if not self.deathmatch_pool.resolve(artist, keep):
+            return "이미 판정되었거나 대기 풀에 없는 작가입니다.", False
+
+        action = "up" if keep else "down"
+        self.current_side_actions[side] = action
+        shown_sides = [
+            current_side
+            for current_side, current_artists in (
+                ("A", self.current_artists_a),
+                ("B", self.current_artists_b),
+            )
+            if current_artists
+        ]
+        self.selection_made = all(
+            self.current_side_actions.get(current_side) in {"up", "down"}
+            for current_side in shown_sides
+        )
+        self.save_current_comparison()
+
+        if keep:
+            message = (
+                f"**{side} · {artist}: UP** — 기존 ELO를 유지한 채 "
+                "전체 작가 풀로 복귀했습니다."
+            )
+        else:
+            message = (
+                f"**{side} · {artist}: DOWN** — 전체 풀 밖으로 확정했습니다. "
+                "ELO 기록은 삭제하지 않습니다."
+            )
+        if self.selection_made:
+            message += "  \n두 작가의 판정이 끝났습니다. 새 비교를 생성하세요."
+        return message, True
 
     def format_weighted_side(
         self,
@@ -5300,6 +5640,13 @@ class ArtistELORanker:
     def create_ui(self) -> gr.Blocks:
         """Create the simplified two-page, mobile-first interface."""
         current_settings = self.current_generation_settings
+        current_ranking_mode = self.artist_manager.get_ranking_mode()
+        if current_ranking_mode not in {
+            RANKING_MODE_BALANCED,
+            RANKING_MODE_TOP,
+            RANKING_MODE_BOTTOM,
+        }:
+            current_ranking_mode = RANKING_MODE_BALANCED
 
         with gr.Blocks(title="Artist ELO Ranker") as app:
             with gr.Row(elem_id="top-bar"):
@@ -5310,7 +5657,8 @@ class ArtistELORanker:
                 )
             with gr.Column(elem_id="app-header"):
                 gr.Markdown(
-                    "전체 작가 풀과 명예의 전당을 각각 평가합니다. "
+                    "전체 작가 풀과 명예의 전당을 각각 평가하고, "
+                    "깨진 하트 작가는 단일 데스매치에서 재심사합니다. "
                     "작가 태그는 선택 전까지 숨길 수 있습니다."
                 )
 
@@ -5482,6 +5830,15 @@ class ArtistELORanker:
                             ),
                             interactive=True,
                         )
+                        ranking_mode_dropdown = gr.Dropdown(
+                            label="전체 풀 대결 방식",
+                            choices=RANKING_VIEW_MODE_CHOICES,
+                            value=current_ranking_mode,
+                            visible=(
+                                self.current_pool_context == POOL_CONTEXT_MAIN
+                            ),
+                            interactive=True,
+                        )
 
                     with gr.Accordion(
                         "임시 작가 리스트 · 전체 풀 투입",
@@ -5526,8 +5883,41 @@ class ArtistELORanker:
                                 elem_classes=["comparison-image"],
                             )
                             with gr.Row(elem_classes=["image-action-row"]):
-                                star_a_btn = gr.Button("☆", size="sm")
-                                heart_a_btn = gr.Button("♡̸", size="sm")
+                                star_a_btn = gr.Button(
+                                    "☆",
+                                    size="sm",
+                                    visible=(
+                                        self.current_pool_context
+                                        != POOL_CONTEXT_DEATHMATCH
+                                    ),
+                                )
+                                heart_a_btn = gr.Button(
+                                    "♡̸",
+                                    size="sm",
+                                    visible=(
+                                        self.current_pool_context
+                                        == POOL_CONTEXT_MAIN
+                                    ),
+                                )
+                            with gr.Row(elem_classes=["deathmatch-action-row"]):
+                                death_down_a_btn = gr.Button(
+                                    "↓ DOWN",
+                                    variant="stop",
+                                    size="sm",
+                                    visible=(
+                                        self.current_pool_context
+                                        == POOL_CONTEXT_DEATHMATCH
+                                    ),
+                                )
+                                death_up_a_btn = gr.Button(
+                                    "↑ UP",
+                                    variant="primary",
+                                    size="sm",
+                                    visible=(
+                                        self.current_pool_context
+                                        == POOL_CONTEXT_DEATHMATCH
+                                    ),
+                                )
                             artists_a_display = gr.Markdown("", visible=False)
                         with gr.Column(elem_classes=["image-card"]):
                             image_b = gr.Image(
@@ -5537,8 +5927,41 @@ class ArtistELORanker:
                                 elem_classes=["comparison-image"],
                             )
                             with gr.Row(elem_classes=["image-action-row"]):
-                                star_b_btn = gr.Button("☆", size="sm")
-                                heart_b_btn = gr.Button("♡̸", size="sm")
+                                star_b_btn = gr.Button(
+                                    "☆",
+                                    size="sm",
+                                    visible=(
+                                        self.current_pool_context
+                                        != POOL_CONTEXT_DEATHMATCH
+                                    ),
+                                )
+                                heart_b_btn = gr.Button(
+                                    "♡̸",
+                                    size="sm",
+                                    visible=(
+                                        self.current_pool_context
+                                        == POOL_CONTEXT_MAIN
+                                    ),
+                                )
+                            with gr.Row(elem_classes=["deathmatch-action-row"]):
+                                death_down_b_btn = gr.Button(
+                                    "↓ DOWN",
+                                    variant="stop",
+                                    size="sm",
+                                    visible=(
+                                        self.current_pool_context
+                                        == POOL_CONTEXT_DEATHMATCH
+                                    ),
+                                )
+                                death_up_b_btn = gr.Button(
+                                    "↑ UP",
+                                    variant="primary",
+                                    size="sm",
+                                    visible=(
+                                        self.current_pool_context
+                                        == POOL_CONTEXT_DEATHMATCH
+                                    ),
+                                )
                             artists_b_display = gr.Markdown("", visible=False)
                     with gr.Row(elem_id="vote-dock"):
                         pick_a_btn = gr.Button(
@@ -5546,12 +5969,20 @@ class ArtistELORanker:
                             variant="primary",
                             size="lg",
                             elem_id="vote-a",
+                            visible=(
+                                self.current_pool_context
+                                != POOL_CONTEXT_DEATHMATCH
+                            ),
                         )
                         pick_b_btn = gr.Button(
                             "B 선택",
                             variant="primary",
                             size="lg",
                             elem_id="vote-b",
+                            visible=(
+                                self.current_pool_context
+                                != POOL_CONTEXT_DEATHMATCH
+                            ),
                         )
                     with gr.Row(elem_id="secondary-actions"):
                         skip_btn = gr.Button(
@@ -5681,6 +6112,7 @@ class ArtistELORanker:
             ranking_generation_inputs = shared_generation_inputs + [
                 pool_context_dropdown,
                 hall_mode_dropdown,
+                ranking_mode_dropdown,
             ]
             weighted_generation_inputs = [
                 prompt_input,
@@ -5717,6 +6149,10 @@ class ArtistELORanker:
                 star_b_btn,
                 heart_a_btn,
                 heart_b_btn,
+                death_down_a_btn,
+                death_up_a_btn,
+                death_down_b_btn,
+                death_up_b_btn,
             ]
             weighted_outputs = [
                 weighted_image_a,
@@ -5747,6 +6183,9 @@ class ArtistELORanker:
 
             def ranking_action_updates():
                 updates = []
+                is_deathmatch = (
+                    self.current_pool_context == POOL_CONTEXT_DEATHMATCH
+                )
                 for side, artists in (
                     ("A", self.current_artists_a),
                     ("B", self.current_artists_b),
@@ -5761,14 +6200,17 @@ class ArtistELORanker:
                         or all_hall
                         else "☆"
                     )
-                    star_interactive = bool(artists) and action not in {
-                        "removed",
-                        "returned",
-                    }
+                    star_interactive = (
+                        not is_deathmatch
+                        and bool(artists)
+                        and action not in {"deathmatch", "returned"}
+                    )
                     heart_visible = (
                         self.current_pool_context == POOL_CONTEXT_MAIN
                     )
                     heart_value = "💔" if action == "removed" else "♡̸"
+                    if action == "deathmatch":
+                        heart_value = "💔"
                     heart_interactive = (
                         bool(artists)
                         and heart_visible
@@ -5777,6 +6219,7 @@ class ArtistELORanker:
                     updates.extend([
                         gr.update(
                             value=star_value,
+                            visible=not is_deathmatch,
                             interactive=star_interactive,
                         ),
                         gr.update(
@@ -5787,6 +6230,32 @@ class ArtistELORanker:
                     ])
                 # Convert side-major [starA, heartA, starB, heartB] to output order.
                 return updates[0], updates[2], updates[1], updates[3]
+
+            def deathmatch_action_updates():
+                updates = []
+                is_deathmatch = (
+                    self.current_pool_context == POOL_CONTEXT_DEATHMATCH
+                )
+                for side, artists in (
+                    ("A", self.current_artists_a),
+                    ("B", self.current_artists_b),
+                ):
+                    action = self.current_side_actions.get(side)
+                    visible = is_deathmatch and bool(artists)
+                    pending = visible and action not in {"up", "down"}
+                    updates.extend([
+                        gr.update(
+                            value="✓ DOWN" if action == "down" else "↓ DOWN",
+                            visible=visible,
+                            interactive=pending,
+                        ),
+                        gr.update(
+                            value="✓ UP" if action == "up" else "↑ UP",
+                            visible=visible,
+                            interactive=pending,
+                        ),
+                    ])
+                return tuple(updates)
 
             def weighted_star_updates():
                 return tuple(
@@ -5815,6 +6284,7 @@ class ArtistELORanker:
                     ),
                     self.format_recent_history(),
                     *ranking_action_updates(),
+                    *deathmatch_action_updates(),
                 )
 
             def weighted_extras():
@@ -5846,6 +6316,7 @@ class ArtistELORanker:
                 noise_schedule_key,
                 pool_context,
                 hall_mode,
+                ranking_mode,
             ):
                 result = run_async(self.generate_new_comparison(
                     prompt,
@@ -5862,17 +6333,26 @@ class ArtistELORanker:
                     noise_schedule_key=noise_schedule_key,
                     pool_context=pool_context,
                     hall_mode=hall_mode,
+                    ranking_mode=ranking_mode,
                 ))
                 return result + ranking_extras()
 
             def on_initial_ranking(*values):
+                saved_is_deathmatch = (
+                    self.current_pool_context == POOL_CONTEXT_DEATHMATCH
+                )
                 has_saved = (
                     self.current_image_a
-                    and self.current_image_b
                     and self.current_image_a.is_file()
-                    and self.current_image_b.is_file()
                     and self.current_artists_a
-                    and self.current_artists_b
+                    and (
+                        saved_is_deathmatch
+                        or (
+                            self.current_image_b
+                            and self.current_image_b.is_file()
+                            and self.current_artists_b
+                        )
+                    )
                 )
                 if not has_saved:
                     return on_generate_ranking(*values)
@@ -5880,7 +6360,11 @@ class ArtistELORanker:
                 can_pick = not self.selection_made
                 core = (
                     str(self.current_image_a),
-                    str(self.current_image_b),
+                    (
+                        str(self.current_image_b)
+                        if self.current_image_b
+                        else None
+                    ),
                     (
                         "저장된 비교를 불러왔습니다."
                         if can_pick
@@ -5891,9 +6375,20 @@ class ArtistELORanker:
                     self.format_top_artists_display(self.current_pool_context),
                     "",
                     "",
-                    gr.update(interactive=can_pick),
-                    gr.update(interactive=can_pick),
-                    gr.update(interactive=self.last_undo_state is not None),
+                    gr.update(
+                        interactive=can_pick and not saved_is_deathmatch,
+                        visible=not saved_is_deathmatch,
+                    ),
+                    gr.update(
+                        interactive=can_pick and not saved_is_deathmatch,
+                        visible=not saved_is_deathmatch,
+                    ),
+                    gr.update(
+                        interactive=(
+                            self.last_undo_state is not None
+                            and not saved_is_deathmatch
+                        ),
+                    ),
                 )
                 return core + ranking_extras()
 
@@ -5954,13 +6449,26 @@ class ArtistELORanker:
             def on_pool_context_change(pool_context):
                 return (
                     gr.update(visible=pool_context == POOL_CONTEXT_HALL),
+                    gr.update(visible=pool_context == POOL_CONTEXT_MAIN),
                     self.format_pool_badge(pool_context),
                     self.format_top_artists_display(pool_context),
                     (
                         "다음 비교부터 명예의 전당 방식을 사용합니다."
                         if pool_context == POOL_CONTEXT_HALL
+                        else (
+                            "다음 비교부터 단일 작가를 각각 UP/DOWN으로 판정합니다."
+                        )
+                        if pool_context == POOL_CONTEXT_DEATHMATCH
                         else "다음 비교부터 전체 작가 풀을 사용합니다."
                     ),
+                )
+
+            def on_ranking_mode_change(ranking_mode):
+                active_mode = self.artist_manager.set_ranking_mode(ranking_mode)
+                return (
+                    f"다음 전체 풀 비교부터 **{get_ranking_mode_label(active_mode)}** "
+                    "방식을 사용합니다.",
+                    self.format_pool_badge(POOL_CONTEXT_MAIN),
                 )
 
             def on_temporary_pool_start(text, pool_context):
@@ -6019,6 +6527,19 @@ class ArtistELORanker:
                     gr.update(interactive=can_pick),
                     gr.update(interactive=can_pick),
                     *ranking_action_updates(),
+                    self.format_temporary_pool_status(),
+                )
+
+            def on_deathmatch_decision(side, keep):
+                message, _ = self.apply_deathmatch_decision(side, keep)
+                return (
+                    message,
+                    self.format_pool_badge(POOL_CONTEXT_DEATHMATCH),
+                    self.format_top_artists_display(POOL_CONTEXT_DEATHMATCH),
+                    gr.update(interactive=False, visible=False),
+                    gr.update(interactive=False, visible=False),
+                    *ranking_action_updates(),
+                    *deathmatch_action_updates(),
                     self.format_temporary_pool_status(),
                 )
 
@@ -6128,7 +6649,18 @@ class ArtistELORanker:
             pool_context_dropdown.change(
                 fn=on_pool_context_change,
                 inputs=[pool_context_dropdown],
-                outputs=[hall_mode_dropdown, pool_badge, leaderboard, status_msg],
+                outputs=[
+                    hall_mode_dropdown,
+                    ranking_mode_dropdown,
+                    pool_badge,
+                    leaderboard,
+                    status_msg,
+                ],
+            )
+            ranking_mode_dropdown.change(
+                fn=on_ranking_mode_change,
+                inputs=[ranking_mode_dropdown],
+                outputs=[status_msg, pool_badge],
             )
             temporary_pool_start_btn.click(
                 fn=on_temporary_pool_start,
@@ -6300,6 +6832,38 @@ class ArtistELORanker:
                 fn=lambda: on_rank_heart("B"),
                 outputs=heart_action_outputs,
             )
+            deathmatch_action_outputs = [
+                status_msg,
+                pool_badge,
+                leaderboard,
+                pick_a_btn,
+                pick_b_btn,
+                star_a_btn,
+                star_b_btn,
+                heart_a_btn,
+                heart_b_btn,
+                death_down_a_btn,
+                death_up_a_btn,
+                death_down_b_btn,
+                death_up_b_btn,
+                temporary_pool_status,
+            ]
+            death_down_a_btn.click(
+                fn=lambda: on_deathmatch_decision("A", False),
+                outputs=deathmatch_action_outputs,
+            ).then(fn=on_export, outputs=[export_file])
+            death_up_a_btn.click(
+                fn=lambda: on_deathmatch_decision("A", True),
+                outputs=deathmatch_action_outputs,
+            ).then(fn=on_export, outputs=[export_file])
+            death_down_b_btn.click(
+                fn=lambda: on_deathmatch_decision("B", False),
+                outputs=deathmatch_action_outputs,
+            ).then(fn=on_export, outputs=[export_file])
+            death_up_b_btn.click(
+                fn=lambda: on_deathmatch_decision("B", True),
+                outputs=deathmatch_action_outputs,
+            ).then(fn=on_export, outputs=[export_file])
             show_artists_toggle.change(
                 fn=lambda show: (
                     gr.update(visible=show),
@@ -6327,6 +6891,10 @@ class ArtistELORanker:
                 star_b_btn,
                 heart_a_btn,
                 heart_b_btn,
+                death_down_a_btn,
+                death_up_a_btn,
+                death_down_b_btn,
+                death_up_b_btn,
             ]
             undo_btn.click(fn=on_rank_undo, outputs=rank_undo_outputs).then(
                 fn=on_export,
