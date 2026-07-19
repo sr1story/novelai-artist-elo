@@ -11,4 +11,10 @@ current_comparison.json
 prompt_presets.json
 temporary_pool.json
 temporary_pool.tmp
+hall_of_fame_pool.json
+hall_of_fame_pool.tmp
+hall_of_fame_elo_ratings.json
+hall_of_fame_elo_ratings.tmp
+weighted_comparison.json
+weighted_comparison.tmp
 screenshots
