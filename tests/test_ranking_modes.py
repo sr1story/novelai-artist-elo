@@ -873,6 +873,29 @@ class RankingModeTests(unittest.TestCase):
         self.assertEqual(main_pool.get_pool_stats()["out_count"], 1)
         self.assertEqual(reloaded.artists, [])
 
+    def test_deathmatch_first_run_migrates_old_heart_exclusions_once(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        artists = ["old_heart", "active"]
+        elo = ELOSystem(ratings={"old_heart": 1325})
+        main_pool = ActivePool(
+            artists,
+            elo,
+            pool_size=2,
+            pool_file=Path(temp_dir.name) / "active_pool.json",
+        )
+        main_pool.remove_artists(["old_heart"], permanent=True)
+        deathmatch_file = Path(temp_dir.name) / "deathmatch.json"
+
+        migrated = DeathmatchPool(artists, main_pool, deathmatch_file)
+        self.assertEqual(migrated.artists, ["old_heart"])
+        self.assertTrue(deathmatch_file.exists())
+
+        self.assertTrue(migrated.resolve("old_heart", keep=False))
+        restarted = DeathmatchPool(artists, main_pool, deathmatch_file)
+        self.assertEqual(restarted.artists, [])
+        self.assertIn("old_heart", main_pool.manual_excluded)
+
     def test_deathmatch_generation_allows_one_final_artist(self):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
