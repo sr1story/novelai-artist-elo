@@ -139,6 +139,27 @@ only removes them from the active pool; it does not delete their ELO rating or
 comparison history. The selected direction is stored in `active_pool.json` and
 survives restarts.
 
+### ELO Candidate Rules
+
+The **Comparison Candidate Rule** dropdown works independently from Ranking
+Direction. During ordinary comparisons it spends about 80% of selections on
+artists matching the chosen rule and keeps about 20% broad coverage. Explicit
+Newcomer/Replacement pool-growth or pool-trimming rounds still take priority so
+the active-pool boundaries remain predictable.
+
+| Candidate rule | Definition |
+|----------------|------------|
+| **All · Auto** | Preserve the existing comparison-count weighting across the active pool |
+| **Familiar** | Artists with at least 10 comparisons |
+| **New** | Artists with fewer than 5 comparisons |
+| **Dark Horse** | Artists with 5-9 comparisons and ELO at or above the active-pool average |
+| **Proven** | Artists with at least 10 comparisons and ELO in the active-pool top 25% |
+
+The leaderboard displays the same labels beside artists. Artists with 5-9
+comparisons below the pool average are shown as **Exploring** until they qualify
+for another label. The selected candidate rule is also stored in
+`active_pool.json` and survives restarts.
+
 ### Pool Health & Statistics
 
 The statistics panel shows the current state of your artist pool and ranking progress.
@@ -148,6 +169,7 @@ The statistics panel shows the current state of your artist pool and ranking pro
 - **Comparisons**: Total number of comparisons made
 - **Artists rated**: How many unique artists have been evaluated
 - **Pool**: Current active pool size vs total available artists
+- **Pool out**: Rated artists that are not currently in the active pool; artists never evaluated are not counted
 - **Pool Health**: Breakdown of artists above/below average and newcomers (<5 matches)
 - **Most likely to rotate out**: Artists at risk of being removed from the pool
 
@@ -167,7 +189,7 @@ Click "Export Leaderboard as CSV" to download the full leaderboard as a CSV file
 
 <img src="screenshots/export_leaderboard.png" width="400">
 
-- Rank, Artist, ELO, Total Comparisons
+- Rank, Artist, candidate label, active/out status, ELO, Total Comparisons
 - Wins, Losses, Win Rate
 - Solo rounds/wins/win rate
 - Duo rounds/wins/win rate
@@ -313,7 +335,7 @@ The application creates/uses several JSON files:
 | File | Purpose |
 |------|---------|
 | `artist_elo_ratings.json` | ELO ratings and comparison counts |
-| `active_pool.json` | Current active pool and selected ranking direction |
+| `active_pool.json` | Current active pool, ranking direction, and candidate rule |
 | `prompt_presets.json` | Ten prompt and image-setting preset slots |
 | `current_comparison.json` | Current images, actual pair seed, and generation settings |
 | `comparison_history.json` | Full history of all comparisons |
