@@ -186,6 +186,47 @@ class RankingModeTests(unittest.TestCase):
         )
         self.assertEqual(ignored_count, 2)
 
+    def test_artist_text_extraction_accepts_copied_statistics_tables(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        tags_file = Path(temp_dir.name) / "artists.txt"
+        tags_file.write_text(
+            "tenjin hidetaka\n"
+            "sciamano240\n"
+            "sousou (sousouworks)\n"
+            "danart14020\n"
+            "dandon fuga\n",
+            encoding="utf-8",
+        )
+        manager = ArtistTagManager(
+            tags_file,
+            ELOSystem(),
+            Path(temp_dir.name) / "temporary_pool.json",
+        )
+        copied_table = (
+            "Name\tCosine\tJaccard\tOverlap\tFrequency\n"
+            "? tenjin_hidetaka 533\t10.85%\t1.40%\t84.02%\t1.40%\n"
+            "? sciamano240 1.0k\t7.17%\t1.26%\t40.18%\t1.28%\n"
+            "? sousou_(sousouworks) 768 2.97% 0.45% 19.16% 0.46%\n"
+            "? sakimichan 1.0k 1.90% 0.33% 10.67% 0.34%\n"
+            "? danart14020 70 4.28% 0.20% 91.39% 0.20%\n"
+            "? dandon_fuga 1.4k"
+        )
+
+        artists, ignored_count = manager.extract_artists_from_text(copied_table)
+
+        self.assertEqual(
+            artists,
+            [
+                "tenjin hidetaka",
+                "sciamano240",
+                "sousou (sousouworks)",
+                "danart14020",
+                "dandon fuga",
+            ],
+        )
+        self.assertEqual(ignored_count, 1)
+
     def test_temporary_pool_persists_and_can_be_stopped_without_clearing(self):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
