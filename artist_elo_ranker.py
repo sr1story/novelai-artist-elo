@@ -1694,25 +1694,74 @@ class ArtistTagManager:
 
         return None
 
+    @staticmethod
+    def _extract_table_artist_name(line: str) -> Optional[str]:
+        """Extract the Name field from copied similarity/frequency table rows."""
+        count = r"\d[\d,]*(?:\.\d+)?[kKmM]?"
+        percent = r"<?-?\d+(?:\.\d+)?%"
+        full_row = re.match(
+            rf"^\s*(?:\?\s+)?(?P<name>.+?)\s+{count}"
+            rf"\s+{percent}\s+{percent}\s+{percent}\s+{percent}\s*$",
+            line,
+        )
+        if full_row:
+            return full_row.group("name").strip()
+
+        # The first copied column sometimes arrives alone as
+        # "? artist_name 1.0k". Requiring the leading marker prevents a
+        # legitimate artist name ending in a number from being truncated.
+        first_column = re.match(
+            rf"^\s*\?\s+(?P<name>.+?)\s+{count}\s*$",
+            line,
+        )
+        if first_column:
+            return first_column.group("name").strip()
+        return None
+
+    @staticmethod
+    def _is_artist_table_header(line: str) -> bool:
+        """Return True for the copied Name/Cosine/Jaccard table header."""
+        normalized = " ".join(line.casefold().split())
+        return (
+            normalized.startswith("name ")
+            and "cosine" in normalized
+            and "jaccard" in normalized
+            and "overlap" in normalized
+            and "frequency" in normalized
+        )
+
     def extract_artists_from_text(self, text: str) -> Tuple[List[str], int]:
-        """Keep only known artists from comma/newline-delimited pasted text."""
-        segments = [
-            segment.strip()
-            for segment in re.split(r"[,;\n|\t]+", text or "")
-            if segment.strip()
-        ]
+        """Keep known artists from plain lists or copied statistics tables."""
         artists = []
         seen = set()
         ignored_count = 0
 
-        for segment in segments:
-            artist = self._match_artist_segment(segment)
+        def keep_artist(candidate: str):
+            nonlocal ignored_count
+            artist = self._match_artist_segment(candidate)
             if artist is None:
                 ignored_count += 1
-                continue
+                return
             if artist not in seen:
                 seen.add(artist)
                 artists.append(artist)
+
+        for line in (text or "").splitlines():
+            line = line.strip()
+            if not line or self._is_artist_table_header(line):
+                continue
+
+            table_name = self._extract_table_artist_name(line)
+            if table_name is not None:
+                keep_artist(table_name)
+                continue
+
+            for segment in re.split(r"[,;|\t]+", line):
+                segment = segment.strip()
+                if not segment:
+                    continue
+                first_column_name = self._extract_table_artist_name(segment)
+                keep_artist(first_column_name or segment)
 
         return artists, ignored_count
 
@@ -2459,8 +2508,8 @@ class ArtistELORanker:
                 "보존되어 있으며 다시 시작할 수 있습니다."
             )
         return (
-            "쉼표 또는 줄바꿈으로 구분된 목록이나 프롬프트를 붙여넣으세요. "
-            "등록된 작가명만 남기고 나머지 텍스트는 제거합니다."
+            "쉼표·줄바꿈 목록, 프롬프트 또는 Name/Cosine/Jaccard 통계 표를 "
+            "붙여넣으세요. 등록된 작가명만 남기고 나머지 텍스트는 제거합니다."
         )
 
     def save_prompt_preset(
@@ -3075,7 +3124,8 @@ class ArtistELORanker:
                     with gr.Accordion("임시 작가 탐색", open=False):
                         gr.Markdown(
                             "붙여넣은 텍스트에서 등록된 작가명만 추출해 "
-                            "기존 활성 풀과 분리된 단독 비교 풀을 만듭니다."
+                            "기존 활성 풀과 분리된 단독 비교 풀을 만듭니다. "
+                            "Name/Cosine/Jaccard/Overlap/Frequency 표도 그대로 붙여넣을 수 있습니다."
                         )
                         temporary_pool_input = gr.Textbox(
                             label="작가 목록 또는 프롬프트",
@@ -3571,7 +3621,7 @@ class ArtistELORanker:
                     return (
                         cleaned_text,
                         f"**시작할 수 없습니다.** 확인된 작가 {len(artists)}명 · "
-                        f"제거한 비작가 항목 {ignored_count}개. 최소 2명이 필요합니다.",
+                        f"제거한 미등록·비작가 항목 {ignored_count}개. 최소 2명이 필요합니다.",
                         self.format_pool_badge(),
                         self.format_top_artists_display(),
                     )
@@ -3589,7 +3639,7 @@ class ArtistELORanker:
                 return (
                     cleaned_text,
                     f"확인된 작가 {len(artists)}명 · "
-                    f"제거한 비작가 항목 {ignored_count}개  \n"
+                    f"제거한 미등록·비작가 항목 {ignored_count}개  \n"
                     + self.format_temporary_pool_status()
                     + "  \n현재 비교 화면은 유지되며 다음 비교부터 적용됩니다.",
                     self.format_pool_badge(),
