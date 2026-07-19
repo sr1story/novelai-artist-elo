@@ -8,6 +8,10 @@ from unittest.mock import AsyncMock, Mock, patch
 from artist_elo_ranker import (
     ActivePool,
     ArtistELORanker,
+    CANDIDATE_RULE_DARK_HORSE,
+    CANDIDATE_RULE_FAMILIAR,
+    CANDIDATE_RULE_NEW,
+    CANDIDATE_RULE_PROVEN,
     ELOSystem,
     GenerationSettings,
     PromptPresetStore,
@@ -64,9 +68,11 @@ class RankingModeTests(unittest.TestCase):
         pool, pool_file = self.make_pool(["a", "b", "c"], pool_size=3)
 
         pool.set_ranking_mode(RANKING_MODE_NEWCOMERS)
+        pool.set_candidate_rule(CANDIDATE_RULE_DARK_HORSE)
 
         saved = json.loads(pool_file.read_text(encoding="utf-8"))
         self.assertEqual(saved["ranking_mode"], RANKING_MODE_NEWCOMERS)
+        self.assertEqual(saved["candidate_rule"], CANDIDATE_RULE_DARK_HORSE)
         reloaded = ActivePool(
             ["a", "b", "c"],
             pool.elo_system,
@@ -74,6 +80,83 @@ class RankingModeTests(unittest.TestCase):
             pool_file=pool_file,
         )
         self.assertEqual(reloaded.get_ranking_mode(), RANKING_MODE_NEWCOMERS)
+        self.assertEqual(
+            reloaded.get_candidate_rule(),
+            CANDIDATE_RULE_DARK_HORSE,
+        )
+
+    def test_candidate_rules_use_comparisons_and_relative_elo(self):
+        artists = ["new", "dark", "exploring", "familiar", "proven"]
+        pool, _ = self.make_pool(
+            artists,
+            active_artists=artists,
+            ratings={
+                "new": 1480,
+                "dark": 1600,
+                "exploring": 1300,
+                "familiar": 1450,
+                "proven": 1800,
+            },
+            comparisons={
+                "new": 2,
+                "dark": 6,
+                "exploring": 6,
+                "familiar": 12,
+                "proven": 12,
+            },
+            pool_size=5,
+        )
+
+        self.assertEqual(pool.get_artist_candidate_label("new"), "새로운")
+        self.assertEqual(pool.get_artist_candidate_label("dark"), "다크호스")
+        self.assertEqual(pool.get_artist_candidate_label("exploring"), "탐색 중")
+        self.assertEqual(pool.get_artist_candidate_label("familiar"), "친숙한")
+        self.assertEqual(pool.get_artist_candidate_label("proven"), "검증된 강자")
+
+        expected = {
+            CANDIDATE_RULE_NEW: ["new"],
+            CANDIDATE_RULE_DARK_HORSE: ["dark"],
+            CANDIDATE_RULE_FAMILIAR: ["familiar", "proven"],
+            CANDIDATE_RULE_PROVEN: ["proven"],
+        }
+        for rule, candidates in expected.items():
+            pool.set_candidate_rule(rule)
+            self.assertEqual(
+                pool._get_candidate_rule_candidates(artists),
+                candidates,
+            )
+
+    def test_candidate_rule_focuses_standard_selection(self):
+        artists = ["dark", "other_a", "other_b"]
+        pool, _ = self.make_pool(
+            artists,
+            active_artists=artists,
+            ratings={"dark": 1700, "other_a": 1400, "other_b": 1400},
+            comparisons={"dark": 6, "other_a": 6, "other_b": 12},
+            pool_size=3,
+        )
+        pool.set_candidate_rule(CANDIDATE_RULE_DARK_HORSE)
+
+        with (
+            patch("artist_elo_ranker.random.random", return_value=0.0),
+            patch("artist_elo_ranker.random.uniform", return_value=0.0),
+        ):
+            selected = pool._select_from_candidates(artists)
+
+        self.assertEqual(selected, "dark")
+
+    def test_pool_out_count_only_includes_evaluated_inactive_artists(self):
+        pool, _ = self.make_pool(
+            ["active_a", "active_b", "removed", "never_seen"],
+            active_artists=["active_a", "active_b"],
+            ratings={"active_a": 1510, "active_b": 1490, "removed": 1400},
+            comparisons={"active_a": 4, "active_b": 4, "removed": 7},
+            pool_size=2,
+        )
+
+        stats = pool.get_pool_stats()
+
+        self.assertEqual(stats["out_count"], 1)
 
     def test_new_mode_below_200_selects_two_outside_artists_as_solos(self):
         active = [f"active_{index}" for index in range(150)]
@@ -135,6 +218,7 @@ class RankingModeTests(unittest.TestCase):
             comparisons=comparisons,
         )
         pool.set_ranking_mode(RANKING_MODE_FAST_ROTATION)
+        pool.set_candidate_rule(CANDIDATE_RULE_DARK_HORSE)
 
         artists_a, artists_b, action = pool.select_comparison_pair()
 
