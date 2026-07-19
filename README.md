@@ -16,7 +16,10 @@ A web-based blind comparison system that ranks Danbooru artist tags by generatin
 - **Undo Support**: Revert the last comparison if you change your mind
 - **Keyboard Shortcuts**: Quick voting with `1`, `2`, `s` (skip), and `0` (undo)
 - **Custom Prompts**: Use your own positive and negative prompts
-- **Generation Settings**: Toggle quality tags, choose from 5 UC (Undesired Content) presets including "None"
+- **NovelAI-Style Settings**: Resolution, steps, guidance, seed, sampler, Variety+, guidance rescale, noise schedule, quality tags, and UC presets
+- **Fair Pair Seeds**: Both images use the same seed in each comparison to reduce luck-based differences
+- **Prompt Presets**: Save and reload the prompt, negative prompt, and every image setting in 10 persistent slots
+- **Anlas Balance**: Show the current NovelAI Anlas balance without external purchase links
 - **Export to CSV**: Download full leaderboard with detailed stats
 - **Comparison History**: View your last 10 comparison results
 
@@ -127,10 +130,11 @@ workflow stay the same when the direction changes.
 | **Balanced** | Existing 1-3 artist combinations, with a mild preference for artists with fewer comparisons |
 | **Newcomer** | Below 200 active artists, compare two never-rated artists outside the pool as solo tags and add both after voting. At 200 or more, compare at-risk pool artists as solos and remove the loser |
 | **Top-Rank Refinement** | Focus 70% of selections on the top 30% of artists with at least 5 comparisons, while keeping 30% balanced coverage |
-| **Replacement** | Above 150 active artists, compare at-risk pool artists as solos and remove the loser. At 150 or fewer, compare two artists outside the pool as solos and add both after voting |
+| **Replacement** | Above 150 active artists, compare the two lowest-ELO pool artists as solos regardless of comparison count and remove the loser. At 150 or fewer, compare two artists outside the pool as solos and add both after voting |
 
-If fewer than two at-risk artists have enough data, Newcomer and Replacement use
-solo calibration comparisons without changing pool membership. Removing an artist
+If fewer than two at-risk artists have enough data, Newcomer uses a solo calibration
+comparison without changing pool membership. Replacement always has two candidates
+while the pool is above 150. Removing an artist
 only removes them from the active pool; it does not delete their ELO rating or
 comparison history. The selected direction is stored in `active_pool.json` and
 survives restarts.
@@ -179,7 +183,7 @@ The "Comparison History" accordion shows your last 10 comparison results (newest
 
 ### Custom Prompts & Generation Settings
 
-Click the "Custom Prompts (Optional)" accordion to access prompt and generation settings.
+Open the **Image Settings** accordion to access the NovelAI-style generation panel.
 
 ![Custom Prompt Editor](screenshots/custom_prompt.png)
 
@@ -219,8 +223,26 @@ NovelAI can automatically add preset tags to your negative prompt. Choose from:
 
 **Tips:**
 - Keep prompts consistent during a ranking session for fair comparisons
-- The same prompt is used for both images (only the artists differ)
+- The same prompt, generation settings, and seed are used for both images (only the artists differ)
 - Test how artists perform with specific subjects (landscapes vs portraits)
+
+#### Image Settings
+
+- Resolution presets: Normal Square, Normal Portrait, and Normal Landscape
+- Steps: 1-50
+- Prompt Guidance: 0-10
+- Seed: leave blank for a new random seed per comparison, or enter a number to lock it
+- Sampler: Euler Ancestral, DPM++ 2M, or Euler
+- Variety+, Prompt Guidance Rescale, and Noise Schedule
+- Each side always generates exactly one image for an unambiguous A/B vote
+
+#### Prompt Presets
+
+Choose slot 1-10, then tap **💾** to save or **📂** to load. A slot stores the
+positive prompt, negative prompt, resolution, steps, guidance, seed, sampler,
+Variety+, guidance rescale, noise schedule, quality toggle, and UC preset. Presets
+are stored in `prompt_presets.json` under `DATA_DIR` and survive redeploys when a
+persistent disk is mounted.
 
 ## Artist Tags File
 
@@ -246,6 +268,10 @@ All configuration is done via environment variables in the `.env` file:
 | `NAI_STEPS` | 28 | Number of diffusion steps |
 | `NAI_IMG_WIDTH` | 1024 | Image width in pixels |
 | `NAI_IMG_HEIGHT` | 1024 | Image height in pixels |
+| `NAI_PROMPT_GUIDANCE` | 5.0 | Default prompt guidance |
+| `NAI_GUIDANCE_RESCALE` | 0.0 | Default prompt guidance rescale |
+| `NAI_SAMPLER` | k_euler_ancestral | Default sampler key |
+| `NAI_NOISE_SCHEDULE` | karras | Default noise schedule |
 | `ELO_DEFAULT` | 1500 | Starting ELO for new artists |
 | `ELO_K_FACTOR` | 32 | ELO K-factor (rating volatility) |
 | `POOL_SIZE` | 150 | Active pool size |
@@ -288,6 +314,8 @@ The application creates/uses several JSON files:
 |------|---------|
 | `artist_elo_ratings.json` | ELO ratings and comparison counts |
 | `active_pool.json` | Current active pool and selected ranking direction |
+| `prompt_presets.json` | Ten prompt and image-setting preset slots |
+| `current_comparison.json` | Current images, actual pair seed, and generation settings |
 | `comparison_history.json` | Full history of all comparisons |
 
 These files are automatically created on first run and persist your rankings across sessions.
