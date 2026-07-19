@@ -1,12 +1,16 @@
+import asyncio
 import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from artist_elo_ranker import (
     ActivePool,
+    ArtistELORanker,
     ELOSystem,
+    GenerationSettings,
+    PromptPresetStore,
     POOL_ACTION_CALIBRATE_SOLO,
     POOL_ACTION_EXPAND_TO_200,
     POOL_ACTION_REFILL_FROM_150,
@@ -15,6 +19,8 @@ from artist_elo_ranker import (
     RANKING_MODE_FAST_ROTATION,
     RANKING_MODE_NEWCOMERS,
     RANKING_MODE_TOP,
+    generate_comparison_pair,
+    generate_image,
 )
 
 
@@ -115,6 +121,25 @@ class RankingModeTests(unittest.TestCase):
         self.assertEqual(action, POOL_ACTION_TRIM_TO_150)
         self.assertEqual(artists_a, ["risk_1"])
         self.assertEqual(artists_b, ["risk_2"])
+
+    def test_replacement_selects_lowest_elo_regardless_of_comparison_count(self):
+        active = [f"artist_{index}" for index in range(151)]
+        ratings = {artist: 1500 for artist in active}
+        ratings.update({"artist_0": 900, "artist_1": 1000, "artist_2": 1100})
+        comparisons = {artist: 20 for artist in active}
+        comparisons.update({"artist_0": 0, "artist_1": 1})
+        pool, _ = self.make_pool(
+            active,
+            active_artists=active,
+            ratings=ratings,
+            comparisons=comparisons,
+        )
+        pool.set_ranking_mode(RANKING_MODE_FAST_ROTATION)
+
+        artists_a, artists_b, action = pool.select_comparison_pair()
+
+        self.assertEqual(action, POOL_ACTION_TRIM_TO_150)
+        self.assertCountEqual(artists_a + artists_b, ["artist_0", "artist_1"])
 
     def test_replacement_mode_at_150_selects_outside_solos(self):
         active = [f"active_{index}" for index in range(150)]
@@ -235,6 +260,151 @@ class RankingModeTests(unittest.TestCase):
         pool.revert_rotation(rotated_out=["a"], rotated_in=["d"])
 
         self.assertCountEqual(pool.pool, ["a", "b", "c"])
+
+    def test_generation_settings_round_trip_all_values(self):
+        settings = GenerationSettings.from_values(
+            "normal_portrait",
+            31,
+            6.4,
+            "k_dpmpp_2m",
+            "123456",
+            True,
+            0.24,
+            "exponential",
+            False,
+            2,
+        )
+
+        restored = GenerationSettings.from_dict(settings.to_dict())
+
+        self.assertEqual(restored, settings)
+        self.assertEqual(restored.dimension_text, "832 × 1216")
+
+    def test_prompt_preset_persists_prompt_negative_and_all_settings(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        filepath = Path(temp_dir.name) / "prompt_presets.json"
+        settings = GenerationSettings.from_values(
+            "normal_landscape",
+            28,
+            5.5,
+            "k_euler_ancestral",
+            "42",
+            True,
+            0.1,
+            "karras",
+            True,
+            3,
+        )
+
+        store = PromptPresetStore(filepath)
+        store.save_slot(10, "portrait, {artist_placeholder}", "text", settings)
+        reloaded = PromptPresetStore(filepath)
+        saved = reloaded.load_slot("10")
+
+        self.assertEqual(saved["prompt"], "portrait, {artist_placeholder}")
+        self.assertEqual(saved["negative_prompt"], "text")
+        self.assertEqual(
+            GenerationSettings.from_dict(saved["settings"]),
+            settings,
+        )
+
+    def test_comparison_pair_passes_one_shared_seed_to_both_images(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        manager = Mock()
+        manager.get_comparison_pair.return_value = (
+            ["artist_a"],
+            ["artist_b"],
+            POOL_ACTION_TRIM_TO_150,
+        )
+        manager.format_artist_tags.side_effect = lambda artists: ", ".join(artists)
+        settings = GenerationSettings()
+
+        with patch(
+            "artist_elo_ranker.generate_image",
+            new=AsyncMock(return_value=True),
+        ) as mocked_generate:
+            result = asyncio.run(
+                generate_comparison_pair(
+                    "1girl, {artist_placeholder}",
+                    manager,
+                    Mock(),
+                    Path(temp_dir.name),
+                    settings,
+                    987654,
+                    "bad anatomy",
+                )
+            )
+
+        self.assertEqual(result[-1], POOL_ACTION_TRIM_TO_150)
+        self.assertEqual(mocked_generate.await_count, 2)
+        self.assertEqual(mocked_generate.await_args_list[0].args[4], 987654)
+        self.assertEqual(mocked_generate.await_args_list[1].args[4], 987654)
+
+    def test_generate_image_applies_every_supported_setting(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        output_path = Path(temp_dir.name) / "generated.png"
+        settings = GenerationSettings.from_values(
+            "normal_portrait",
+            33,
+            6.6,
+            "k_dpmpp_2m",
+            None,
+            True,
+            0.22,
+            "polyexponential",
+            False,
+            -1,
+        )
+        captured = []
+
+        async def fake_request(instance, session):
+            captured.append(instance)
+            return Mock(files=[("generated.png", b"image-bytes")])
+
+        with patch(
+            "artist_elo_ranker.GenerateImageInfer.request",
+            new=fake_request,
+        ):
+            success = asyncio.run(
+                generate_image(
+                    Mock(),
+                    "1girl, artist: example",
+                    output_path,
+                    settings,
+                    7654321,
+                    "bad anatomy",
+                )
+            )
+
+        self.assertTrue(success)
+        self.assertEqual(output_path.read_bytes(), b"image-bytes")
+        params = captured[0].parameters
+        self.assertEqual((params.width, params.height), (832, 1216))
+        self.assertEqual(params.steps, 33)
+        self.assertEqual(params.seed, 7654321)
+        self.assertEqual(params.scale, 6.6)
+        self.assertEqual(params.cfg_rescale, 0.22)
+        self.assertIsNone(params.ucPreset)
+        self.assertFalse(params.qualityToggle)
+        self.assertIsNotNone(params.skip_cfg_above_sigma)
+        self.assertEqual(params.noise_schedule.value, "polyexponential")
+
+    def test_anlas_balance_is_read_from_subscription_response(self):
+        ranker = ArtistELORanker.__new__(ArtistELORanker)
+        ranker.anlas_balance = None
+        ranker.get_session = Mock(return_value=Mock())
+
+        with patch(
+            "artist_elo_ranker.Subscription.request",
+            new=AsyncMock(return_value=Mock(anlas_left=10006)),
+        ):
+            balance = asyncio.run(ranker.refresh_anlas_balance())
+
+        self.assertEqual(balance, 10006)
+        self.assertIn("10,006", ranker.format_anlas_display())
 
 
 if __name__ == "__main__":
