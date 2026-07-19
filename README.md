@@ -164,9 +164,12 @@ for another label. The selected candidate rule is also stored in
 ### Temporary Artist Discovery
 
 Open **Temporary Artist Discovery**, then paste a comma- or newline-delimited
-artist list or prompt. The app keeps only exact matches from the bundled artist
-tag file, accepts `artist: name`, prompt-weight wrappers, and space/underscore
-variants, removes duplicates, and discards every non-artist segment.
+artist list, prompt, or a copied `Name / Cosine / Jaccard / Overlap / Frequency`
+statistics table. For table rows, the app automatically removes the leading `?`,
+post-count values such as `533` or `1.0k`, and all metric columns. It then keeps
+only exact matches from the bundled artist tag file, accepts `artist: name`,
+prompt-weight wrappers, and space/underscore variants, removes duplicates, and
+discards every unregistered or non-artist segment.
 
 After at least two artists are recognized, start the temporary pool. Temporary
 comparisons are always solo-vs-solo for clear attribution. Votes still update the
