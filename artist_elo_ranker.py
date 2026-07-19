@@ -15,13 +15,22 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import gradio as gr
 from pydantic import SecretStr
 
 from novelai_python import GenerateImageInfer, ImageGenerateResp, ApiCredential
-from novelai_python.sdk.ai.generate_image import Model, Sampler, UCPreset
+from novelai_python.sdk.ai.generate_image import (
+    Action,
+    Model,
+    NoiseSchedule,
+    Sampler,
+    UCPreset,
+    get_default_params,
+    get_supported_params,
+)
+from novelai_python.sdk.user.subscription import Subscription
 
 # Import configuration
 from config import (
@@ -33,9 +42,14 @@ from config import (
     COMPARISON_HISTORY_FILE,
     ACTIVE_POOL_FILE,
     CURRENT_COMPARISON_FILE,
+    PROMPT_PRESETS_FILE,
     STEPS,
     IMG_WIDTH,
     IMG_HEIGHT,
+    PROMPT_GUIDANCE,
+    PROMPT_GUIDANCE_RESCALE,
+    NAI_SAMPLER,
+    NAI_NOISE_SCHEDULE,
     DEFAULT_ELO,
     K_FACTOR,
     ACTIVE_POOL_SIZE,
@@ -58,6 +72,272 @@ MODEL = Model.NAI_DIFFUSION_4_5_FULL
 SAMPLER = Sampler.K_EULER_ANCESTRAL
 UC_PRESET = UCPreset.TYPE0
 
+MAX_SEED = 4294967288
+
+RESOLUTION_PRESETS = {
+    "normal_square": {
+        "label": "Normal Square",
+        "width": 1024,
+        "height": 1024,
+    },
+    "normal_portrait": {
+        "label": "Normal Portrait",
+        "width": 832,
+        "height": 1216,
+    },
+    "normal_landscape": {
+        "label": "Normal Landscape",
+        "width": 1216,
+        "height": 832,
+    },
+}
+
+SAMPLER_OPTIONS = {
+    "k_euler_ancestral": {
+        "label": "Euler Ancestral",
+        "value": Sampler.K_EULER_ANCESTRAL,
+    },
+    "k_dpmpp_2m": {
+        "label": "DPM++ 2M",
+        "value": Sampler.K_DPMPP_2M,
+    },
+    "k_euler": {
+        "label": "Euler",
+        "value": Sampler.K_EULER,
+    },
+}
+
+NOISE_SCHEDULE_OPTIONS = {
+    "karras": {
+        "label": "karras",
+        "value": NoiseSchedule.KARRAS,
+    },
+    "exponential": {
+        "label": "exponential",
+        "value": NoiseSchedule.EXPONENTIAL,
+    },
+    "polyexponential": {
+        "label": "polyexponential",
+        "value": NoiseSchedule.POLYEXPONENTIAL,
+    },
+}
+
+
+def _default_resolution_key() -> str:
+    """Match configured dimensions to a preset, falling back to square."""
+    for key, preset in RESOLUTION_PRESETS.items():
+        if preset["width"] == IMG_WIDTH and preset["height"] == IMG_HEIGHT:
+            return key
+    return "normal_square"
+
+
+@dataclass
+class GenerationSettings:
+    """Validated NovelAI settings shared by both sides of a comparison."""
+
+    resolution_key: str = field(default_factory=_default_resolution_key)
+    steps: int = STEPS
+    guidance: float = PROMPT_GUIDANCE
+    sampler_key: str = NAI_SAMPLER
+    seed: Optional[int] = None
+    variety_boost: bool = False
+    guidance_rescale: float = PROMPT_GUIDANCE_RESCALE
+    noise_schedule_key: str = NAI_NOISE_SCHEDULE
+    quality_toggle: bool = True
+    uc_preset: int = 0
+
+    def __post_init__(self):
+        if self.resolution_key not in RESOLUTION_PRESETS:
+            self.resolution_key = _default_resolution_key()
+        if self.sampler_key not in SAMPLER_OPTIONS:
+            self.sampler_key = "k_euler_ancestral"
+        if self.noise_schedule_key not in NOISE_SCHEDULE_OPTIONS:
+            self.noise_schedule_key = "karras"
+        self.steps = max(1, min(50, int(self.steps)))
+        self.guidance = round(
+            max(0.0, min(10.0, float(self.guidance))),
+            1,
+        )
+        rescale = max(
+            0.0,
+            min(1.0, float(self.guidance_rescale)),
+        )
+        self.guidance_rescale = round(round(rescale / 0.02) * 0.02, 2)
+
+    @classmethod
+    def from_values(
+        cls,
+        resolution_key: Any,
+        steps: Any,
+        guidance: Any,
+        sampler_key: Any,
+        seed: Any,
+        variety_boost: Any,
+        guidance_rescale: Any,
+        noise_schedule_key: Any,
+        quality_toggle: Any,
+        uc_preset: Any,
+    ) -> "GenerationSettings":
+        """Build settings from Gradio values and reject unsafe seed input."""
+        resolution = str(resolution_key or _default_resolution_key())
+        if resolution not in RESOLUTION_PRESETS:
+            resolution = _default_resolution_key()
+
+        sampler = str(sampler_key or NAI_SAMPLER)
+        if sampler not in SAMPLER_OPTIONS:
+            sampler = "k_euler_ancestral"
+
+        noise_schedule = str(noise_schedule_key or NAI_NOISE_SCHEDULE)
+        if noise_schedule not in NOISE_SCHEDULE_OPTIONS:
+            noise_schedule = "karras"
+
+        seed_value: Optional[int] = None
+        if seed is not None and str(seed).strip():
+            try:
+                seed_value = int(str(seed).strip())
+            except (TypeError, ValueError) as exc:
+                raise ValueError("시드는 숫자로 입력하거나 비워 두세요.") from exc
+            if seed_value < 1 or seed_value > MAX_SEED:
+                raise ValueError(f"시드는 1~{MAX_SEED} 범위여야 합니다.")
+
+        try:
+            steps_value = max(1, min(50, int(round(float(steps)))))
+            guidance_value = max(0.0, min(10.0, float(guidance)))
+            rescale_value = max(0.0, min(1.0, float(guidance_rescale)))
+            uc_value = int(uc_preset)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("이미지 설정값을 확인해 주세요.") from exc
+
+        if uc_value not in {-1, 0, 1, 2, 3}:
+            uc_value = 0
+
+        return cls(
+            resolution_key=resolution,
+            steps=steps_value,
+            guidance=round(guidance_value, 1),
+            sampler_key=sampler,
+            seed=seed_value,
+            variety_boost=bool(variety_boost),
+            guidance_rescale=round(round(rescale_value / 0.02) * 0.02, 2),
+            noise_schedule_key=noise_schedule,
+            quality_toggle=bool(quality_toggle),
+            uc_preset=uc_value,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "GenerationSettings":
+        """Load persisted settings while tolerating old or malformed files."""
+        if not isinstance(data, dict):
+            return cls()
+        try:
+            return cls.from_values(
+                data.get("resolution_key", _default_resolution_key()),
+                data.get("steps", STEPS),
+                data.get("guidance", PROMPT_GUIDANCE),
+                data.get("sampler_key", NAI_SAMPLER),
+                data.get("seed"),
+                data.get("variety_boost", False),
+                data.get("guidance_rescale", PROMPT_GUIDANCE_RESCALE),
+                data.get("noise_schedule_key", NAI_NOISE_SCHEDULE),
+                data.get("quality_toggle", True),
+                data.get("uc_preset", 0),
+            )
+        except ValueError:
+            return cls()
+
+    @property
+    def width(self) -> int:
+        return int(RESOLUTION_PRESETS[self.resolution_key]["width"])
+
+    @property
+    def height(self) -> int:
+        return int(RESOLUTION_PRESETS[self.resolution_key]["height"])
+
+    @property
+    def dimension_text(self) -> str:
+        return f"{self.width} × {self.height}"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "resolution_key": self.resolution_key,
+            "width": self.width,
+            "height": self.height,
+            "steps": self.steps,
+            "guidance": self.guidance,
+            "sampler_key": self.sampler_key,
+            "seed": self.seed,
+            "variety_boost": self.variety_boost,
+            "guidance_rescale": self.guidance_rescale,
+            "noise_schedule_key": self.noise_schedule_key,
+            "quality_toggle": self.quality_toggle,
+            "uc_preset": self.uc_preset,
+        }
+
+
+class PromptPresetStore:
+    """Persist ten prompt and generation-setting slots on the data disk."""
+
+    SLOT_COUNT = 10
+
+    def __init__(self, filepath: Path):
+        self.filepath = filepath
+        self.slots: Dict[str, Dict[str, Any]] = {}
+        self.load()
+
+    @classmethod
+    def normalize_slot(cls, slot: Any) -> str:
+        try:
+            value = int(slot)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("프리셋 슬롯을 선택해 주세요.") from exc
+        if value < 1 or value > cls.SLOT_COUNT:
+            raise ValueError("프리셋 슬롯은 1~10 중에서 선택해 주세요.")
+        return str(value)
+
+    def load(self):
+        if not self.filepath.exists():
+            return
+        try:
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            raw_slots = data.get("slots", {}) if isinstance(data, dict) else {}
+            if isinstance(raw_slots, dict):
+                self.slots = {
+                    key: value
+                    for key, value in raw_slots.items()
+                    if key.isdigit()
+                    and 1 <= int(key) <= self.SLOT_COUNT
+                    and isinstance(value, dict)
+                }
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            print(f"Could not load prompt presets: {exc}")
+
+    def save(self):
+        self.filepath.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = self.filepath.with_suffix(".tmp")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "slots": self.slots}, f, indent=2)
+        temp_file.replace(self.filepath)
+
+    def save_slot(
+        self,
+        slot: Any,
+        prompt: str,
+        negative_prompt: str,
+        settings: GenerationSettings,
+    ):
+        slot_key = self.normalize_slot(slot)
+        self.slots[slot_key] = {
+            "prompt": str(prompt or ""),
+            "negative_prompt": str(negative_prompt or ""),
+            "settings": settings.to_dict(),
+            "saved_at": int(time.time()),
+        }
+        self.save()
+
+    def load_slot(self, slot: Any) -> Optional[Dict[str, Any]]:
+        return self.slots.get(self.normalize_slot(slot))
+
 
 # --------------------------------------------------------------------------------
 # Mobile-first UI
@@ -73,9 +353,17 @@ APP_HEAD = """
 
 MOBILE_CSS = """
 .gradio-container {
+    --background-fill-primary: #101426;
+    --background-fill-secondary: #171b31;
+    --block-background-fill: #171b31;
+    --border-color-primary: #2b3054;
+    --body-text-color: #f5f5f7;
+    --body-text-color-subdued: #a9acbd;
     max-width: 1320px !important;
     margin: 0 auto !important;
     padding-bottom: calc(7rem + env(safe-area-inset-bottom)) !important;
+    color-scheme: dark;
+    background: #101426;
 }
 
 #app-header h1 {
@@ -86,6 +374,103 @@ MOBILE_CSS = """
 #app-header p {
     margin-top: 0;
     color: var(--body-text-color-subdued);
+}
+
+#top-bar {
+    align-items: center;
+    border: 1px solid #272b4b;
+    border-radius: 16px;
+    padding: .55rem .85rem;
+    background: #15192f;
+    margin-bottom: .75rem;
+}
+
+#top-bar-title {
+    flex: 1 1 auto;
+}
+
+#top-bar-title h1 {
+    margin: 0;
+    font-size: 1.35rem;
+}
+
+#anlas-balance {
+    flex: 0 0 auto;
+    min-width: 150px;
+    border: 1px solid #2b3054;
+    border-radius: 12px;
+    padding: .55rem .9rem;
+    text-align: center;
+    background: #101328;
+}
+
+#anlas-balance p {
+    margin: 0;
+    color: #fffbd2;
+    font-size: 1.05rem;
+    font-weight: 750;
+}
+
+#nai-settings-panel {
+    border: 1px solid #282d50;
+    border-radius: 16px;
+    padding: .8rem;
+    background: #171b31;
+}
+
+#nai-settings-panel .form {
+    gap: .7rem;
+}
+
+#resolution-row,
+#seed-sampler-row,
+#preset-actions {
+    gap: .65rem;
+}
+
+#dimension-display textarea,
+#dimension-display input {
+    text-align: center;
+    font-size: 1.05rem;
+    font-weight: 650;
+}
+
+#image-count-note {
+    border: 1px solid #282d50;
+    border-radius: 12px;
+    padding: .55rem .8rem;
+    background: #11142a;
+}
+
+#image-count-note p {
+    margin: 0;
+}
+
+#settings-reset button,
+#preset-save button,
+#preset-load button {
+    min-height: 44px;
+    font-size: 1.05rem;
+}
+
+#preset-slots label {
+    min-width: 42px;
+}
+
+#preset-status p {
+    margin: .2rem 0 0;
+    color: var(--body-text-color-subdued);
+}
+
+#pool-badge {
+    border: 1px solid #333960;
+    border-radius: 14px;
+    padding: .7rem .9rem;
+    background: #171b31;
+}
+
+#pool-badge p {
+    margin: 0;
 }
 
 #status-card {
@@ -147,6 +532,23 @@ MOBILE_CSS = """
 
     #app-header h1 {
         font-size: 1.55rem;
+    }
+
+    #top-bar {
+        padding: .45rem .6rem;
+    }
+
+    #top-bar-title h1 {
+        font-size: 1.12rem;
+    }
+
+    #anlas-balance {
+        min-width: 118px;
+        padding: .45rem .55rem;
+    }
+
+    #nai-settings-panel {
+        padding: .55rem;
     }
 
     #desktop-help {
@@ -213,7 +615,7 @@ RANKING_MODE_CONFIG = {
     },
     RANKING_MODE_FAST_ROTATION: {
         "label": "교체",
-        "description": "풀 150명 초과에서는 교체 위험 작가를 단독 비교하고, 150명 이하에서는 풀 밖 작가를 단독 비교합니다.",
+        "description": "풀 150명 초과에서는 비교 횟수와 무관하게 ELO 최하위 작가를 단독 비교하고, 150명 이하에서는 풀 밖 작가를 단독 비교합니다.",
         "removal_probability": 0.15,
         "addition_probability": 0.15,
     },
@@ -259,11 +661,10 @@ def get_pool_action_status(pool_action: str) -> str:
         POOL_ACTION_REFILL_FROM_150,
     }:
         return "풀 밖 작가 단일 비교입니다. 선택 후 두 작가가 활성 풀에 들어갑니다."
-    if pool_action in {
-        POOL_ACTION_TRIM_FROM_200,
-        POOL_ACTION_TRIM_TO_150,
-    }:
+    if pool_action == POOL_ACTION_TRIM_FROM_200:
         return "교체 후보 단일 비교입니다. 선택한 뒤 패자는 활성 풀에서 제외됩니다."
+    if pool_action == POOL_ACTION_TRIM_TO_150:
+        return "ELO 최하위 작가 생존 비교입니다. 선택한 뒤 패자는 활성 풀에서 제외됩니다."
     if pool_action == POOL_ACTION_CALIBRATE_SOLO:
         return "교체 후보 판정을 위한 단일 비교입니다. 이번 비교에서는 풀을 교체하지 않습니다."
     return "이미지가 생성되었습니다. 더 마음에 드는 쪽을 선택하세요."
@@ -565,6 +966,15 @@ class ActivePool:
         elo_gap = max(0.0, pool_max_elo - self.elo_system.get_rating(artist))
         return max(1.0, (elo_gap / 100.0) ** 2)
 
+    def _get_lowest_elo_candidates(self, count: int = 2) -> List[str]:
+        """Return the active pool's lowest-rated artists, randomizing ties."""
+        shuffled = self.pool.copy()
+        random.shuffle(shuffled)
+        return sorted(
+            shuffled,
+            key=lambda artist: self.elo_system.get_rating(artist),
+        )[:count]
+
     def _select_solo_pair(
         self,
         candidates: List[str],
@@ -623,10 +1033,7 @@ class ActivePool:
         elif self.ranking_mode == RANKING_MODE_FAST_ROTATION:
             if len(self.pool) > REPLACEMENT_POOL_FLOOR:
                 directional_action = POOL_ACTION_TRIM_TO_150
-                directional_candidates = self._get_at_risk_candidates()
-                directional_weights = [
-                    self._get_removal_weight(a) for a in directional_candidates
-                ]
+                directional_candidates = self._get_lowest_elo_candidates(2)
             else:
                 directional_action = POOL_ACTION_REFILL_FROM_150
                 outside_pool = [a for a in self.all_artists if a not in self.pool]
@@ -892,7 +1299,8 @@ class ActivePool:
         """Get statistics about the current pool."""
         if not self.pool:
             return {"size": 0, "avg_comparisons": 0, "avg_elo": DEFAULT_ELO,
-                    "at_risk": [], "newcomers": 0, "safe": 0, "total_artists": 0}
+                    "at_risk": [], "lowest_elo": [], "newcomers": 0,
+                    "safe": 0, "total_artists": 0}
 
         comparisons = [self.elo_system.get_artist_comparison_count(a) for a in self.pool]
         elos = [self.elo_system.get_rating(a) for a in self.pool]
@@ -922,6 +1330,17 @@ class ActivePool:
 
         # Sort at_risk by weight (most likely to be removed first)
         at_risk.sort(key=lambda x: x[3], reverse=True)
+        lowest_elo = sorted(
+            (
+                (
+                    artist,
+                    self.elo_system.get_rating(artist),
+                    self.elo_system.get_artist_comparison_count(artist),
+                )
+                for artist in self.pool
+            ),
+            key=lambda item: item[1],
+        )[:10]
 
         return {
             "size": len(self.pool),
@@ -932,6 +1351,7 @@ class ActivePool:
             "total_artists": len(self.all_artists),
             "at_risk": at_risk[:10],  # Top 10 most at risk
             "at_risk_count": len(at_risk),
+            "lowest_elo": lowest_elo,
             "newcomers": newcomers,
             "safe": safe,
             "ranking_mode": self.ranking_mode,
@@ -1120,9 +1540,9 @@ async def generate_image(
     session: ApiCredential,
     prompt: str,
     output_path: Path,
+    settings: GenerationSettings,
+    pair_seed: int,
     negative_prompt: str = None,
-    quality_toggle: bool = True,
-    uc_preset: int = 0
 ) -> bool:
     """Generate a single image and save it."""
     try:
@@ -1134,18 +1554,33 @@ async def generate_image(
             2: UCPreset.TYPE2,
             3: UCPreset.TYPE3,
         }
-        gen = GenerateImageInfer.build_generate(
-            prompt=prompt,
-            width=IMG_WIDTH,
-            height=IMG_HEIGHT,
+        sampler = SAMPLER_OPTIONS[settings.sampler_key]["value"]
+        noise_schedule = NOISE_SCHEDULE_OPTIONS[
+            settings.noise_schedule_key
+        ]["value"]
+        params = get_default_params(MODEL)
+        params.width = settings.width
+        params.height = settings.height
+        params.steps = settings.steps
+        params.seed = pair_seed
+        params.sampler = sampler
+        params.negative_prompt = negative_prompt if negative_prompt else NEGATIVE_PROMPT
+        params.ucPreset = uc_preset_map.get(settings.uc_preset)
+        params.qualityToggle = settings.quality_toggle
+        params.dynamic_thresholding = False
+        params.scale = settings.guidance
+        params.cfg_rescale = settings.guidance_rescale
+        params.noise_schedule = noise_schedule
+        params.skip_cfg_above_sigma = (
+            get_supported_params(MODEL).cfgDelaySigma
+            if settings.variety_boost
+            else None
+        )
+        gen = GenerateImageInfer(
+            input=prompt,
             model=MODEL,
-            steps=STEPS,
-            sampler=SAMPLER,
-            negative_prompt=negative_prompt if negative_prompt else NEGATIVE_PROMPT,
-            ucPreset=uc_preset_map.get(uc_preset, UCPreset.TYPE0),
-            qualityToggle=quality_toggle,
-            decrisp_mode=False,
-            variety_boost=False,
+            action=Action.GENERATE,
+            parameters=params,
         )
 
         resp = await gen.request(session=session)
@@ -1168,9 +1603,9 @@ async def generate_comparison_pair(
     artist_manager: ArtistTagManager,
     session: ApiCredential,
     output_dir: Path,
+    settings: GenerationSettings,
+    pair_seed: int,
     negative_prompt: str = None,
-    quality_toggle: bool = True,
-    uc_preset: int = 0
 ) -> Tuple[Optional[Path], Optional[Path], List[str], List[str], str]:
     """
     Generate two images with different artist combinations.
@@ -1193,11 +1628,25 @@ async def generate_comparison_pair(
 
     print(f"Generating image A with artists: {artists_a}")
     print(f"Prompt A: {prompt_a[:200]}...")
-    success_a = await generate_image(session, prompt_a, path_a, negative_prompt, quality_toggle, uc_preset)
+    success_a = await generate_image(
+        session,
+        prompt_a,
+        path_a,
+        settings,
+        pair_seed,
+        negative_prompt,
+    )
 
     print(f"Generating image B with artists: {artists_b}")
     print(f"Prompt B: {prompt_b[:200]}...")
-    success_b = await generate_image(session, prompt_b, path_b, negative_prompt, quality_toggle, uc_preset)
+    success_b = await generate_image(
+        session,
+        prompt_b,
+        path_b,
+        settings,
+        pair_seed,
+        negative_prompt,
+    )
 
     if success_a and success_b:
         return path_a, path_b, artists_a, artists_b, pool_action
@@ -1217,6 +1666,8 @@ class ComparisonRecord:
     winner: str  # "A" or "B"
     image_a_path: str
     image_b_path: str
+    generation_settings: Dict[str, Any] = field(default_factory=dict)
+    pair_seed: Optional[int] = None
 
 
 class ComparisonHistory:
@@ -1246,7 +1697,9 @@ class ComparisonHistory:
             "artists_b": record.artists_b,
             "winner": record.winner,
             "image_a_path": record.image_a_path,
-            "image_b_path": record.image_b_path
+            "image_b_path": record.image_b_path,
+            "generation_settings": record.generation_settings,
+            "pair_seed": record.pair_seed,
         })
         self.save()
 
@@ -1334,6 +1787,8 @@ class UndoState:
     prev_artists_a: List[str] = field(default_factory=list)
     prev_artists_b: List[str] = field(default_factory=list)
     prev_pool_action: str = POOL_ACTION_STANDARD
+    prev_generation_settings: Dict[str, Any] = field(default_factory=dict)
+    prev_pair_seed: Optional[int] = None
 
 
 class ArtistELORanker:
@@ -1350,7 +1805,9 @@ class ArtistELORanker:
         # Initialize the active pool with ELO system
         self.artist_manager.initialize_pool(self.elo_system)
         self.history = ComparisonHistory(COMPARISON_HISTORY_FILE)
+        self.preset_store = PromptPresetStore(PROMPT_PRESETS_FILE)
         self.session: Optional[ApiCredential] = None
+        self.anlas_balance: Optional[int] = None
 
         # Current comparison state
         self.current_image_a: Optional[Path] = None
@@ -1360,8 +1817,12 @@ class ArtistELORanker:
         self.current_prompt: str = DEFAULT_PROMPT
         self.current_custom_prompt: str = ""
         self.current_negative_prompt: str = ""
-        self.current_quality_toggle: bool = True
-        self.current_uc_preset: int = 0
+        self.current_generation_settings = GenerationSettings()
+        self.current_quality_toggle: bool = (
+            self.current_generation_settings.quality_toggle
+        )
+        self.current_uc_preset: int = self.current_generation_settings.uc_preset
+        self.current_pair_seed: Optional[int] = None
         self.current_pool_action: str = POOL_ACTION_STANDARD
 
         # Undo state
@@ -1416,8 +1877,19 @@ class ArtistELORanker:
             self.current_prompt = str(data.get("processed_prompt", DEFAULT_PROMPT))
             self.current_custom_prompt = str(data.get("custom_prompt", ""))
             self.current_negative_prompt = str(data.get("negative_prompt", ""))
-            self.current_quality_toggle = bool(data.get("quality_toggle", True))
-            self.current_uc_preset = int(data.get("uc_preset", 0))
+            legacy_settings = {
+                "quality_toggle": data.get("quality_toggle", True),
+                "uc_preset": data.get("uc_preset", 0),
+            }
+            self.current_generation_settings = GenerationSettings.from_dict(
+                data.get("generation_settings", legacy_settings)
+            )
+            self.current_quality_toggle = (
+                self.current_generation_settings.quality_toggle
+            )
+            self.current_uc_preset = self.current_generation_settings.uc_preset
+            pair_seed = data.get("pair_seed")
+            self.current_pair_seed = int(pair_seed) if pair_seed is not None else None
             self.current_pool_action = str(
                 data.get("pool_action", POOL_ACTION_STANDARD)
             )
@@ -1440,6 +1912,8 @@ class ArtistELORanker:
             "negative_prompt": self.current_negative_prompt,
             "quality_toggle": self.current_quality_toggle,
             "uc_preset": self.current_uc_preset,
+            "generation_settings": self.current_generation_settings.to_dict(),
+            "pair_seed": self.current_pair_seed,
             "pool_action": self.current_pool_action,
             "selection_made": self.selection_made,
         }
@@ -1457,6 +1931,56 @@ class ArtistELORanker:
             api_key = get_api_key()
             self.session = ApiCredential(api_token=SecretStr(api_key))
         return self.session
+
+    async def refresh_anlas_balance(self) -> Optional[int]:
+        """Refresh the NovelAI Anlas balance without blocking image generation."""
+        try:
+            response = await Subscription().request(session=self.get_session())
+            self.anlas_balance = int(response.anlas_left)
+        except Exception as exc:
+            print(f"Could not refresh Anlas balance: {exc}")
+        return self.anlas_balance
+
+    def format_anlas_display(self) -> str:
+        balance = "—" if self.anlas_balance is None else f"{self.anlas_balance:,}"
+        return f"◆ **{balance} Anlas**"
+
+    def format_pool_badge(self) -> str:
+        stats = self.artist_manager.get_pool_stats()
+        mode = get_ranking_mode_label(self.artist_manager.get_ranking_mode())
+        return (
+            f"**활성 풀 {stats.get('size', 0)}명** · "
+            f"전체 {stats.get('total_artists', 0)}명 · **{mode}**"
+        )
+
+    def save_prompt_preset(
+        self,
+        slot: Any,
+        prompt: str,
+        negative_prompt: str,
+        settings: GenerationSettings,
+    ) -> str:
+        self.preset_store.save_slot(
+            slot,
+            prompt,
+            negative_prompt,
+            settings,
+        )
+        return f"프리셋 {int(slot)}번에 현재 프롬프트와 설정을 저장했습니다."
+
+    def load_prompt_preset(
+        self,
+        slot: Any,
+    ) -> Tuple[str, str, GenerationSettings]:
+        data = self.preset_store.load_slot(slot)
+        if data is None:
+            raise ValueError(f"프리셋 {int(slot)}번은 아직 비어 있습니다.")
+        settings = GenerationSettings.from_dict(data.get("settings", {}))
+        return (
+            str(data.get("prompt", "")),
+            str(data.get("negative_prompt", "")),
+            settings,
+        )
 
     def export_leaderboard_csv(self) -> str:
         """Export full leaderboard sorted by ELO as CSV with detailed stats."""
@@ -1577,7 +2101,17 @@ class ArtistELORanker:
 
         # Show top at-risk artists
         at_risk = pool_stats.get('at_risk', [])
-        if at_risk:
+        lowest_elo = pool_stats.get('lowest_elo', [])
+        if (
+            self.artist_manager.get_ranking_mode()
+            == RANKING_MODE_FAST_ROTATION
+            and lowest_elo
+        ):
+            lines.append("")
+            lines.append("**ELO 최하위 작가:**")
+            for artist, elo, matches in lowest_elo[:5]:
+                lines.append(f"- {artist} ({elo:.0f}, {matches}회)")
+        elif at_risk:
             lines.append("")
             lines.append("**교체 가능성이 높은 작가:**")
             for artist, elo, matches, weight in at_risk[:5]:
@@ -1605,11 +2139,47 @@ class ArtistELORanker:
         quality_toggle: bool = True,
         uc_preset: int = 0,
         ranking_mode: str = RANKING_MODE_BALANCED,
+        resolution_key: str = "normal_square",
+        steps: int = STEPS,
+        guidance: float = PROMPT_GUIDANCE,
+        variety_boost: bool = False,
+        seed: Any = None,
+        sampler_key: str = NAI_SAMPLER,
+        guidance_rescale: float = PROMPT_GUIDANCE_RESCALE,
+        noise_schedule_key: str = NAI_NOISE_SCHEDULE,
     ):
         """Generate a new pair of images for comparison."""
         custom_prompt = custom_prompt or ""
         custom_negative_prompt = custom_negative_prompt or ""
         self.artist_manager.set_ranking_mode(ranking_mode)
+
+        try:
+            settings = GenerationSettings.from_values(
+                resolution_key,
+                steps,
+                guidance,
+                sampler_key,
+                seed,
+                variety_boost,
+                guidance_rescale,
+                noise_schedule_key,
+                quality_toggle,
+                uc_preset,
+            )
+        except ValueError as exc:
+            return (
+                None,
+                None,
+                f"**설정 오류:** {exc}",
+                self.format_pool_badge(),
+                self.format_anlas_display(),
+                self.format_top_artists_display(),
+                "",
+                "",
+                gr.update(interactive=False),
+                gr.update(interactive=False),
+                gr.update(interactive=False),
+            )
 
         # Use custom prompt if provided, otherwise default
         base_prompt = custom_prompt.strip() if custom_prompt.strip() else DEFAULT_PROMPT
@@ -1628,8 +2198,10 @@ class ArtistELORanker:
         self.current_prompt = base_prompt
         self.current_custom_prompt = custom_prompt
         self.current_negative_prompt = custom_negative_prompt
-        self.current_quality_toggle = bool(quality_toggle)
-        self.current_uc_preset = int(uc_preset)
+        self.current_generation_settings = settings
+        self.current_quality_toggle = settings.quality_toggle
+        self.current_uc_preset = settings.uc_preset
+        self.current_pair_seed = settings.seed or random.randint(1, MAX_SEED)
 
         try:
             session = self.get_session()
@@ -1644,6 +2216,8 @@ class ArtistELORanker:
                 None,
                 None,
                 error_msg,
+                self.format_pool_badge(),
+                self.format_anlas_display(),
                 self.format_top_artists_display(),
                 "",
                 "",
@@ -1657,10 +2231,12 @@ class ArtistELORanker:
             self.artist_manager,
             session,
             COMPARISON_IMAGES_DIR,
+            settings,
+            self.current_pair_seed,
             negative_prompt,
-            quality_toggle,
-            uc_preset
         )
+
+        await self.refresh_anlas_balance()
 
         if path_a and path_b:
             self.current_image_a = path_a
@@ -1682,6 +2258,8 @@ class ArtistELORanker:
                 str(path_a),
                 str(path_b),
                 get_pool_action_status(pool_action),
+                self.format_pool_badge(),
+                self.format_anlas_display(),
                 self.format_top_artists_display(),
                 "",  # Clear result_msg
                 "",  # Clear details_msg
@@ -1694,6 +2272,8 @@ class ArtistELORanker:
                 None,
                 None,
                 "이미지 생성에 실패했습니다. 잠시 후 건너뛰기를 눌러 다시 시도하세요.",
+                self.format_pool_badge(),
+                self.format_anlas_display(),
                 self.format_top_artists_display(),
                 "",
                 "",
@@ -1770,6 +2350,8 @@ class ArtistELORanker:
             prev_artists_a=self.current_artists_a.copy(),
             prev_artists_b=self.current_artists_b.copy(),
             prev_pool_action=self.current_pool_action,
+            prev_generation_settings=self.current_generation_settings.to_dict(),
+            prev_pair_seed=self.current_pair_seed,
         )
         self.selection_made = True
         self.save_current_comparison()
@@ -1781,7 +2363,9 @@ class ArtistELORanker:
             artists_b=self.current_artists_b,
             winner=winner,
             image_a_path=str(self.current_image_a) if self.current_image_a else "",
-            image_b_path=str(self.current_image_b) if self.current_image_b else ""
+            image_b_path=str(self.current_image_b) if self.current_image_b else "",
+            generation_settings=self.current_generation_settings.to_dict(),
+            pair_seed=self.current_pair_seed,
         )
         self.history.add_record(record)
 
@@ -1863,6 +2447,14 @@ class ArtistELORanker:
         self.current_artists_a = state.prev_artists_a.copy()
         self.current_artists_b = state.prev_artists_b.copy()
         self.current_pool_action = state.prev_pool_action
+        self.current_generation_settings = GenerationSettings.from_dict(
+            state.prev_generation_settings
+        )
+        self.current_quality_toggle = (
+            self.current_generation_settings.quality_toggle
+        )
+        self.current_uc_preset = self.current_generation_settings.uc_preset
+        self.current_pair_seed = state.prev_pair_seed
 
         # Clear undo state and reset selection
         self.last_undo_state = None
@@ -1884,9 +2476,16 @@ class ArtistELORanker:
     def create_ui(self) -> gr.Blocks:
         """Create the Gradio interface."""
 
+        current_settings = self.current_generation_settings
+
         with gr.Blocks(title="Artist ELO Ranker") as app:
+            with gr.Row(elem_id="top-bar"):
+                gr.Markdown("# Artist ELO", elem_id="top-bar-title")
+                anlas_display = gr.Markdown(
+                    self.format_anlas_display(),
+                    elem_id="anlas-balance",
+                )
             with gr.Column(elem_id="app-header"):
-                gr.Markdown("# Artist ELO Ranker")
                 gr.Markdown(
                     "두 이미지를 비교해 더 마음에 드는 쪽을 선택하세요. "
                     "선택 전에는 작가 태그가 숨겨집니다.  \n"
@@ -1908,42 +2507,158 @@ class ArtistELORanker:
                         )
                     )
 
-                    # Prompt input
-                    with gr.Accordion("생성 설정", open=False):
-                        prompt_input = gr.Textbox(
-                            label="프롬프트",
-                            placeholder="비워 두면 기본 프롬프트를 사용합니다. 작가 태그는 자동으로 들어갑니다.",
-                            lines=4,
-                            value=self.current_custom_prompt,
-                        )
-                        negative_prompt_input = gr.Textbox(
-                            label="네거티브 프롬프트",
-                            placeholder="비워 두면 기본 네거티브 프롬프트를 사용합니다.",
-                            lines=3,
-                            value=self.current_negative_prompt,
-                        )
-                        with gr.Row():
-                            quality_toggle = gr.Checkbox(
-                                label="품질 태그 추가",
-                                value=self.current_quality_toggle,
-                                info="very aesthetic, masterpiece, no text를 추가합니다.",
-                            )
-                            uc_preset_dropdown = gr.Dropdown(
-                                label="자동 네거티브 프리셋",
-                                choices=[
-                                    ("없음", -1),
-                                    ("Heavy · 표준 품질 필터", 0),
-                                    ("Light · 최소 필터", 1),
-                                    ("Human Focus · 인물 중심", 2),
-                                    ("Heavy + Anatomy · 신체 보정", 3),
-                                ],
-                                value=self.current_uc_preset,
-                                interactive=True,
-                            )
-                        gr.Markdown(
-                            "*`{artist_placeholder}`를 넣으면 해당 위치에 작가 태그가 삽입됩니다.*"
-                        )
+                    with gr.Accordion("Image Settings", open=False):
+                        with gr.Column(elem_id="nai-settings-panel"):
+                            with gr.Row(elem_id="resolution-row"):
+                                resolution_dropdown = gr.Dropdown(
+                                    label="Image Settings",
+                                    choices=[
+                                        (preset["label"], key)
+                                        for key, preset in RESOLUTION_PRESETS.items()
+                                    ],
+                                    value=current_settings.resolution_key,
+                                    interactive=True,
+                                )
+                                dimension_display = gr.Textbox(
+                                    label="Resolution",
+                                    value=current_settings.dimension_text,
+                                    interactive=False,
+                                    elem_id="dimension-display",
+                                )
 
+                            gr.Markdown(
+                                "🖼️ **비교 이미지 · 후보당 1장**  ",
+                                elem_id="image-count-note",
+                            )
+
+                            with gr.Row():
+                                gr.Markdown("### AI Settings")
+                                settings_reset_btn = gr.Button(
+                                    "↻ 기본값",
+                                    size="sm",
+                                    elem_id="settings-reset",
+                                )
+
+                            steps_slider = gr.Slider(
+                                minimum=1,
+                                maximum=50,
+                                step=1,
+                                value=current_settings.steps,
+                                label="Steps",
+                            )
+                            with gr.Row():
+                                guidance_slider = gr.Slider(
+                                    minimum=0,
+                                    maximum=10,
+                                    step=0.1,
+                                    value=current_settings.guidance,
+                                    label="Prompt Guidance",
+                                )
+                                variety_toggle = gr.Checkbox(
+                                    label="Variety+",
+                                    value=current_settings.variety_boost,
+                                )
+
+                            with gr.Row(elem_id="seed-sampler-row"):
+                                seed_input = gr.Textbox(
+                                    label="Seed",
+                                    value=(
+                                        str(current_settings.seed)
+                                        if current_settings.seed is not None
+                                        else ""
+                                    ),
+                                    placeholder="비우면 매 비교마다 새 시드",
+                                )
+                                sampler_dropdown = gr.Dropdown(
+                                    label="Sampler",
+                                    choices=[
+                                        (option["label"], key)
+                                        for key, option in SAMPLER_OPTIONS.items()
+                                    ],
+                                    value=current_settings.sampler_key,
+                                    interactive=True,
+                                )
+
+                            with gr.Accordion("Advanced Settings", open=False):
+                                guidance_rescale_slider = gr.Slider(
+                                    minimum=0,
+                                    maximum=1,
+                                    step=0.02,
+                                    value=current_settings.guidance_rescale,
+                                    label="Prompt Guidance Rescale",
+                                )
+                                noise_schedule_dropdown = gr.Dropdown(
+                                    label="Noise Schedule",
+                                    choices=[
+                                        (option["label"], key)
+                                        for key, option in NOISE_SCHEDULE_OPTIONS.items()
+                                    ],
+                                    value=current_settings.noise_schedule_key,
+                                    interactive=True,
+                                )
+
+                            gr.Markdown("### Prompt")
+                            prompt_input = gr.Textbox(
+                                label="프롬프트",
+                                placeholder="비워 두면 기본 프롬프트를 사용합니다. 작가 태그는 자동으로 들어갑니다.",
+                                lines=4,
+                                value=self.current_custom_prompt,
+                            )
+                            negative_prompt_input = gr.Textbox(
+                                label="네거티브 프롬프트",
+                                placeholder="비워 두면 기본 네거티브 프롬프트를 사용합니다.",
+                                lines=3,
+                                value=self.current_negative_prompt,
+                            )
+                            with gr.Row():
+                                quality_toggle = gr.Checkbox(
+                                    label="품질 태그 추가",
+                                    value=current_settings.quality_toggle,
+                                    info="very aesthetic, masterpiece, no text를 추가합니다.",
+                                )
+                                uc_preset_dropdown = gr.Dropdown(
+                                    label="자동 네거티브 프리셋",
+                                    choices=[
+                                        ("없음", -1),
+                                        ("Heavy · 표준 품질 필터", 0),
+                                        ("Light · 최소 필터", 1),
+                                        ("Human Focus · 인물 중심", 2),
+                                        ("Heavy + Anatomy · 신체 보정", 3),
+                                    ],
+                                    value=current_settings.uc_preset,
+                                    interactive=True,
+                                )
+                            gr.Markdown(
+                                "*`{artist_placeholder}`를 넣으면 해당 위치에 작가 태그가 삽입됩니다.*"
+                            )
+
+                            gr.Markdown("### Prompt Presets")
+                            preset_slot = gr.Radio(
+                                choices=[str(slot) for slot in range(1, 11)],
+                                value="1",
+                                label="프리셋 슬롯",
+                                elem_id="preset-slots",
+                            )
+                            with gr.Row(elem_id="preset-actions"):
+                                preset_save_btn = gr.Button(
+                                    "💾",
+                                    variant="secondary",
+                                    elem_id="preset-save",
+                                )
+                                preset_load_btn = gr.Button(
+                                    "📂",
+                                    variant="secondary",
+                                    elem_id="preset-load",
+                                )
+                            preset_status = gr.Markdown(
+                                "번호를 고른 뒤 💾 저장 또는 📂 불러오기를 누르세요.",
+                                elem_id="preset-status",
+                            )
+
+                    pool_badge = gr.Markdown(
+                        self.format_pool_badge(),
+                        elem_id="pool-badge",
+                    )
                     # Status message
                     status_msg = gr.Markdown("비교 이미지를 준비하고 있습니다…", elem_id="status-card")
 
@@ -2001,8 +2716,54 @@ class ArtistELORanker:
                     with gr.Accordion("최근 비교 기록", open=False):
                         history_display = gr.Markdown(self.format_recent_history())
 
+            generation_inputs = [
+                prompt_input,
+                negative_prompt_input,
+                quality_toggle,
+                uc_preset_dropdown,
+                ranking_mode_dropdown,
+                resolution_dropdown,
+                steps_slider,
+                guidance_slider,
+                variety_toggle,
+                seed_input,
+                sampler_dropdown,
+                guidance_rescale_slider,
+                noise_schedule_dropdown,
+            ]
+            comparison_outputs = [
+                image_a,
+                image_b,
+                status_msg,
+                pool_badge,
+                anlas_display,
+                leaderboard,
+                result_msg,
+                details_msg,
+                pick_a_btn,
+                pick_b_btn,
+                undo_btn,
+                artists_a_display,
+                artists_b_display,
+                history_display,
+            ]
+
             # Event handlers
-            def on_generate(prompt, negative_prompt, quality_tags, uc_preset, ranking_mode):
+            def on_generate(
+                prompt,
+                negative_prompt,
+                quality_tags,
+                uc_preset,
+                ranking_mode,
+                resolution_key,
+                steps,
+                guidance,
+                variety_boost,
+                seed,
+                sampler_key,
+                guidance_rescale,
+                noise_schedule_key,
+            ):
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
@@ -2013,6 +2774,14 @@ class ArtistELORanker:
                             quality_tags,
                             uc_preset,
                             ranking_mode,
+                            resolution_key,
+                            steps,
+                            guidance,
+                            variety_boost,
+                            seed,
+                            sampler_key,
+                            guidance_rescale,
+                            noise_schedule_key,
                         )
                     )
                     # Add artist display text and history to result
@@ -2023,7 +2792,21 @@ class ArtistELORanker:
                 finally:
                     loop.close()
 
-            def on_initial_load(prompt, negative_prompt, quality_tags, uc_preset, ranking_mode):
+            def on_initial_load(
+                prompt,
+                negative_prompt,
+                quality_tags,
+                uc_preset,
+                ranking_mode,
+                resolution_key,
+                steps,
+                guidance,
+                variety_boost,
+                seed,
+                sampler_key,
+                guidance_rescale,
+                noise_schedule_key,
+            ):
                 """Reuse a saved pair on refresh; only generate when none exists."""
                 self.artist_manager.set_ranking_mode(ranking_mode)
                 has_saved_pair = (
@@ -2041,7 +2824,22 @@ class ArtistELORanker:
                         quality_tags,
                         uc_preset,
                         ranking_mode,
+                        resolution_key,
+                        steps,
+                        guidance,
+                        variety_boost,
+                        seed,
+                        sampler_key,
+                        guidance_rescale,
+                        noise_schedule_key,
                     )
+
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(self.refresh_anlas_balance())
+                finally:
+                    loop.close()
 
                 can_pick = not self.selection_made
                 status = (
@@ -2054,6 +2852,8 @@ class ArtistELORanker:
                     str(self.current_image_a),
                     str(self.current_image_b),
                     status,
+                    self.format_pool_badge(),
+                    self.format_anlas_display(),
                     self.format_top_artists_display(),
                     "",
                     "",
@@ -2065,7 +2865,21 @@ class ArtistELORanker:
                     self.format_recent_history(),
                 )
 
-            def on_pick_then_generate(prompt, negative_prompt, quality_tags, uc_preset, ranking_mode):
+            def on_pick_then_generate(
+                prompt,
+                negative_prompt,
+                quality_tags,
+                uc_preset,
+                ranking_mode,
+                resolution_key,
+                steps,
+                guidance,
+                variety_boost,
+                seed,
+                sampler_key,
+                guidance_rescale,
+                noise_schedule_key,
+            ):
                 """Generate new comparison after pick (for chaining)."""
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
@@ -2077,6 +2891,14 @@ class ArtistELORanker:
                             quality_tags,
                             uc_preset,
                             ranking_mode,
+                            resolution_key,
+                            steps,
+                            guidance,
+                            variety_boost,
+                            seed,
+                            sampler_key,
+                            guidance_rescale,
+                            noise_schedule_key,
                         )
                     )
                     artists_a_text = f"**작가:** {', '.join(self.current_artists_a)}"
@@ -2108,7 +2930,16 @@ class ArtistELORanker:
                 artists_a_text = f"**작가:** {', '.join(self.current_artists_a)}" if self.current_artists_a else ""
                 artists_b_text = f"**작가:** {', '.join(self.current_artists_b)}" if self.current_artists_b else ""
                 history_text = self.format_recent_history()
-                return result + (artists_a_text, artists_b_text, history_text)
+                return (
+                    result[0],
+                    result[1],
+                    result[2],
+                    self.format_pool_badge(),
+                    *result[3:],
+                    artists_a_text,
+                    artists_b_text,
+                    history_text,
+                )
 
             def on_mode_change(ranking_mode):
                 """Persist the preset without generating or resetting any ranking data."""
@@ -2116,19 +2947,216 @@ class ArtistELORanker:
                 return (
                     get_ranking_mode_description(active_mode),
                     self.format_top_artists_display(),
+                    self.format_pool_badge(),
                 )
+
+            def on_resolution_change(resolution_key):
+                settings = GenerationSettings.from_values(
+                    resolution_key,
+                    STEPS,
+                    PROMPT_GUIDANCE,
+                    NAI_SAMPLER,
+                    None,
+                    False,
+                    PROMPT_GUIDANCE_RESCALE,
+                    NAI_NOISE_SCHEDULE,
+                    True,
+                    0,
+                )
+                return settings.dimension_text
+
+            def on_reset_settings():
+                settings = GenerationSettings()
+                return (
+                    settings.resolution_key,
+                    settings.dimension_text,
+                    settings.steps,
+                    settings.guidance,
+                    settings.variety_boost,
+                    "",
+                    settings.sampler_key,
+                    settings.guidance_rescale,
+                    settings.noise_schedule_key,
+                    settings.quality_toggle,
+                    settings.uc_preset,
+                    "이미지 생성 설정을 기본값으로 되돌렸습니다.",
+                )
+
+            def build_settings_from_form(
+                resolution_key,
+                steps,
+                guidance,
+                variety_boost,
+                seed,
+                sampler_key,
+                guidance_rescale,
+                noise_schedule_key,
+                quality_tags,
+                uc_preset,
+            ):
+                return GenerationSettings.from_values(
+                    resolution_key,
+                    steps,
+                    guidance,
+                    sampler_key,
+                    seed,
+                    variety_boost,
+                    guidance_rescale,
+                    noise_schedule_key,
+                    quality_tags,
+                    uc_preset,
+                )
+
+            def on_save_preset(
+                slot,
+                prompt,
+                negative_prompt,
+                resolution_key,
+                steps,
+                guidance,
+                variety_boost,
+                seed,
+                sampler_key,
+                guidance_rescale,
+                noise_schedule_key,
+                quality_tags,
+                uc_preset,
+            ):
+                try:
+                    settings = build_settings_from_form(
+                        resolution_key,
+                        steps,
+                        guidance,
+                        variety_boost,
+                        seed,
+                        sampler_key,
+                        guidance_rescale,
+                        noise_schedule_key,
+                        quality_tags,
+                        uc_preset,
+                    )
+                    return self.save_prompt_preset(
+                        slot,
+                        prompt,
+                        negative_prompt,
+                        settings,
+                    )
+                except (OSError, ValueError) as exc:
+                    return f"프리셋 저장 실패: {exc}"
+
+            def on_load_preset(slot):
+                try:
+                    prompt, negative_prompt, settings = self.load_prompt_preset(slot)
+                    return (
+                        prompt,
+                        negative_prompt,
+                        settings.resolution_key,
+                        settings.dimension_text,
+                        settings.steps,
+                        settings.guidance,
+                        settings.variety_boost,
+                        str(settings.seed) if settings.seed is not None else "",
+                        settings.sampler_key,
+                        settings.guidance_rescale,
+                        settings.noise_schedule_key,
+                        settings.quality_toggle,
+                        settings.uc_preset,
+                        f"프리셋 {int(slot)}번을 불러왔습니다. 다음 비교부터 적용됩니다.",
+                    )
+                except ValueError as exc:
+                    return (
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        str(exc),
+                    )
 
             ranking_mode_dropdown.change(
                 fn=on_mode_change,
                 inputs=[ranking_mode_dropdown],
-                outputs=[ranking_mode_help, leaderboard],
+                outputs=[ranking_mode_help, leaderboard, pool_badge],
+            )
+
+            resolution_dropdown.change(
+                fn=on_resolution_change,
+                inputs=[resolution_dropdown],
+                outputs=[dimension_display],
+            )
+
+            settings_reset_btn.click(
+                fn=on_reset_settings,
+                outputs=[
+                    resolution_dropdown,
+                    dimension_display,
+                    steps_slider,
+                    guidance_slider,
+                    variety_toggle,
+                    seed_input,
+                    sampler_dropdown,
+                    guidance_rescale_slider,
+                    noise_schedule_dropdown,
+                    quality_toggle,
+                    uc_preset_dropdown,
+                    preset_status,
+                ],
+            )
+
+            preset_save_btn.click(
+                fn=on_save_preset,
+                inputs=[
+                    preset_slot,
+                    prompt_input,
+                    negative_prompt_input,
+                    resolution_dropdown,
+                    steps_slider,
+                    guidance_slider,
+                    variety_toggle,
+                    seed_input,
+                    sampler_dropdown,
+                    guidance_rescale_slider,
+                    noise_schedule_dropdown,
+                    quality_toggle,
+                    uc_preset_dropdown,
+                ],
+                outputs=[preset_status],
+            )
+
+            preset_load_btn.click(
+                fn=on_load_preset,
+                inputs=[preset_slot],
+                outputs=[
+                    prompt_input,
+                    negative_prompt_input,
+                    resolution_dropdown,
+                    dimension_display,
+                    steps_slider,
+                    guidance_slider,
+                    variety_toggle,
+                    seed_input,
+                    sampler_dropdown,
+                    guidance_rescale_slider,
+                    noise_schedule_dropdown,
+                    quality_toggle,
+                    uc_preset_dropdown,
+                    preset_status,
+                ],
             )
 
             # Auto-generate first comparison on app load
             app.load(
                 fn=on_initial_load,
-                inputs=[prompt_input, negative_prompt_input, quality_toggle, uc_preset_dropdown, ranking_mode_dropdown],
-                outputs=[image_a, image_b, status_msg, leaderboard, result_msg, details_msg, pick_a_btn, pick_b_btn, undo_btn, artists_a_display, artists_b_display, history_display]
+                inputs=generation_inputs,
+                outputs=comparison_outputs,
             )
 
             # Pick A: update ELO, then auto-generate next pair, then refresh CSV
@@ -2137,8 +3165,8 @@ class ArtistELORanker:
                 outputs=[result_msg, details_msg, leaderboard, pick_a_btn, pick_b_btn, undo_btn]
             ).then(
                 fn=on_pick_then_generate,
-                inputs=[prompt_input, negative_prompt_input, quality_toggle, uc_preset_dropdown, ranking_mode_dropdown],
-                outputs=[image_a, image_b, status_msg, leaderboard, result_msg, details_msg, pick_a_btn, pick_b_btn, undo_btn, artists_a_display, artists_b_display, history_display]
+                inputs=generation_inputs,
+                outputs=comparison_outputs,
             ).then(
                 fn=on_export,
                 outputs=[export_file]
@@ -2150,8 +3178,8 @@ class ArtistELORanker:
                 outputs=[result_msg, details_msg, leaderboard, pick_a_btn, pick_b_btn, undo_btn]
             ).then(
                 fn=on_pick_then_generate,
-                inputs=[prompt_input, negative_prompt_input, quality_toggle, uc_preset_dropdown, ranking_mode_dropdown],
-                outputs=[image_a, image_b, status_msg, leaderboard, result_msg, details_msg, pick_a_btn, pick_b_btn, undo_btn, artists_a_display, artists_b_display, history_display]
+                inputs=generation_inputs,
+                outputs=comparison_outputs,
             ).then(
                 fn=on_export,
                 outputs=[export_file]
@@ -2160,7 +3188,21 @@ class ArtistELORanker:
             # Undo: restore previous state and images, then refresh CSV
             undo_btn.click(
                 fn=on_undo,
-                outputs=[image_a, image_b, status_msg, leaderboard, result_msg, details_msg, pick_a_btn, pick_b_btn, undo_btn, artists_a_display, artists_b_display, history_display]
+                outputs=[
+                    image_a,
+                    image_b,
+                    status_msg,
+                    pool_badge,
+                    leaderboard,
+                    result_msg,
+                    details_msg,
+                    pick_a_btn,
+                    pick_b_btn,
+                    undo_btn,
+                    artists_a_display,
+                    artists_b_display,
+                    history_display,
+                ],
             ).then(
                 fn=on_export,
                 outputs=[export_file]
@@ -2176,8 +3218,8 @@ class ArtistELORanker:
             # Skip: generate new images without any ELO changes
             skip_btn.click(
                 fn=on_pick_then_generate,
-                inputs=[prompt_input, negative_prompt_input, quality_toggle, uc_preset_dropdown, ranking_mode_dropdown],
-                outputs=[image_a, image_b, status_msg, leaderboard, result_msg, details_msg, pick_a_btn, pick_b_btn, undo_btn, artists_a_display, artists_b_display, history_display]
+                inputs=generation_inputs,
+                outputs=comparison_outputs,
             )
 
             # Export leaderboard - generate CSV and show download link

@@ -45,6 +45,8 @@ active_pool.json
 comparison_history.json
 current_comparison.json
 current_comparison.tmp
+prompt_presets.json
+prompt_presets.tmp
 data/
 
 # OS files
