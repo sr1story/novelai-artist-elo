@@ -16,6 +16,7 @@ from artist_elo_ranker import (
     ComparisonHistory,
     ELOSystem,
     GenerationSettings,
+    HallOfFamePool,
     PromptPresetStore,
     POOL_ACTION_CALIBRATE_SOLO,
     POOL_ACTION_EXPAND_TO_200,
@@ -26,6 +27,9 @@ from artist_elo_ranker import (
     RANKING_MODE_FAST_ROTATION,
     RANKING_MODE_NEWCOMERS,
     RANKING_MODE_TOP,
+    COMPARISON_MODE_NORMAL,
+    COMPARISON_MODE_SOLO,
+    COMPARISON_MODE_WEIGHTED,
     generate_comparison_pair,
     generate_image,
 )
@@ -258,7 +262,7 @@ class RankingModeTests(unittest.TestCase):
         self.assertFalse(stopped.temporary_pool_enabled)
         self.assertEqual(stopped.temporary_pool, ["alpha", "beta", "gamma"])
 
-    def test_temporary_comparison_is_solo_and_never_mutates_active_pool(self):
+    def test_temporary_comparison_uses_normal_combinations_and_joins_main_pool(self):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         artists = ["active_a", "active_b", "temp_a", "temp_b", "temp_c"]
@@ -279,8 +283,6 @@ class RankingModeTests(unittest.TestCase):
         manager.active_pool.pool = ["active_a", "active_b"]
         manager.active_pool.save()
         manager.activate_temporary_pool(["temp_a", "temp_b", "temp_c"])
-        original_pool = manager.active_pool.pool.copy()
-
         artists_a, artists_b, action = manager.get_comparison_pair()
         rotated_out, rotated_in = manager.process_result(
             artists_a,
@@ -289,13 +291,23 @@ class RankingModeTests(unittest.TestCase):
         )
 
         self.assertEqual(action, POOL_ACTION_TEMPORARY)
-        self.assertEqual(len(artists_a), 1)
-        self.assertEqual(len(artists_b), 1)
-        self.assertNotEqual(artists_a, artists_b)
-        self.assertTrue(set(artists_a + artists_b) <= set(manager.temporary_pool))
+        self.assertGreaterEqual(len(artists_a), 1)
+        self.assertLessEqual(len(artists_a), 3)
+        self.assertGreaterEqual(len(artists_b), 1)
+        self.assertLessEqual(len(artists_b), 3)
+        self.assertFalse(set(artists_a) & set(artists_b))
+        used_temporary = (
+            set(artists_a + artists_b) & {"temp_a", "temp_b", "temp_c"}
+        )
+        self.assertTrue(set(artists_a) & used_temporary)
+        self.assertTrue(set(artists_b) & used_temporary)
         self.assertEqual(rotated_out, [])
-        self.assertEqual(rotated_in, [])
-        self.assertEqual(manager.active_pool.pool, original_pool)
+        self.assertEqual(
+            {artist for artist, _, _ in rotated_in},
+            used_temporary,
+        )
+        self.assertTrue(used_temporary <= set(manager.active_pool.pool))
+        self.assertFalse(used_temporary & set(manager.temporary_pool))
 
     def test_undo_first_temporary_vote_removes_new_rating_entries(self):
         temp_dir = tempfile.TemporaryDirectory()
@@ -536,6 +548,195 @@ class RankingModeTests(unittest.TestCase):
         pool.revert_rotation(rotated_out=["a"], rotated_in=["d"])
 
         self.assertCountEqual(pool.pool, ["a", "b", "c"])
+
+    def test_hall_of_fame_resets_hof_elo_and_preserves_main_elo(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        artists = ["a", "b", "c", "d"]
+        main_elo = ELOSystem(
+            ratings={"a": 1812},
+            artist_comparisons={"a": 12},
+        )
+        main_pool = ActivePool(
+            artists,
+            main_elo,
+            pool_size=4,
+            pool_file=Path(temp_dir.name) / "active_pool.json",
+        )
+        hof_elo = ELOSystem(
+            ratings={"a": 1930},
+            artist_comparisons={"a": 9},
+        )
+        hall = HallOfFamePool(
+            artists,
+            hof_elo,
+            main_pool,
+            Path(temp_dir.name) / "hall.json",
+        )
+
+        self.assertEqual(hall.induct(["a"]), ["a"])
+        self.assertNotIn("a", main_pool.pool)
+        self.assertEqual(hof_elo.get_rating("a"), 1500)
+        self.assertEqual(hof_elo.get_artist_comparison_count("a"), 0)
+
+        hof_elo.ratings["a"] = 1725
+        self.assertEqual(hall.return_to_main(["a"]), ["a"])
+        self.assertIn("a", main_pool.pool)
+        self.assertEqual(main_elo.get_rating("a"), 1812)
+
+        hall.induct(["a"])
+        self.assertEqual(hof_elo.get_rating("a"), 1500)
+        self.assertEqual(hof_elo.get_artist_comparison_count("a"), 0)
+
+    def test_hall_modes_are_disjoint_and_weighted_mode_is_balanced(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        artists = [f"artist_{index}" for index in range(20)]
+        main_elo = ELOSystem()
+        main_pool = ActivePool(
+            artists,
+            main_elo,
+            pool_size=20,
+            pool_file=Path(temp_dir.name) / "active_pool.json",
+        )
+        hof_elo = ELOSystem(
+            ratings={artist: 1400 + index * 15 for index, artist in enumerate(artists)}
+        )
+        hall = HallOfFamePool(
+            artists,
+            hof_elo,
+            main_pool,
+            Path(temp_dir.name) / "hall.json",
+        )
+        hall.induct(artists)
+
+        solo_a, solo_b = hall.select_pair(COMPARISON_MODE_SOLO)
+        self.assertEqual((len(solo_a), len(solo_b)), (1, 1))
+        self.assertFalse(set(solo_a) & set(solo_b))
+
+        normal_a, normal_b = hall.select_pair(COMPARISON_MODE_NORMAL)
+        self.assertIn(len(normal_a), {1, 2, 3})
+        self.assertIn(len(normal_b), {1, 2, 3})
+        self.assertFalse(set(normal_a) & set(normal_b))
+
+        artists_a, artists_b, weights_a, weights_b = (
+            hall.select_weighted_pair(10)
+        )
+        self.assertEqual(len(artists_a), 10)
+        self.assertEqual(len(artists_b), 10)
+        self.assertFalse(set(artists_a) & set(artists_b))
+        self.assertAlmostEqual(sum(weights_a), sum(weights_b))
+        self.assertTrue(all(0.5 <= weight <= 2.0 for weight in weights_a + weights_b))
+
+    def test_image_star_round_trip_restores_main_rating(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        artists = ["a", "b", "c"]
+        main_elo = ELOSystem(ratings={"a": 1777, "b": 1666})
+        main_pool = ActivePool(
+            artists,
+            main_elo,
+            pool_size=3,
+            pool_file=Path(temp_dir.name) / "active_pool.json",
+        )
+        hof_elo = ELOSystem()
+        hall = HallOfFamePool(
+            artists,
+            hof_elo,
+            main_pool,
+            Path(temp_dir.name) / "hall.json",
+        )
+        ranker = ArtistELORanker.__new__(ArtistELORanker)
+        ranker.elo_system = main_elo
+        ranker.hall_elo_system = hof_elo
+        ranker.hall_pool = hall
+        ranker.artist_manager = Mock(
+            active_pool=main_pool,
+            temporary_pool=[],
+            temporary_pool_enabled=False,
+        )
+        ranker.artist_manager.save_temporary_pool = Mock()
+        ranker.current_artists_a = ["a", "b"]
+        ranker.current_artists_b = ["c"]
+        ranker.current_pool_context = "main"
+        ranker.current_side_actions = {"A": None, "B": None}
+        ranker.current_image_a = None
+        ranker.current_image_b = None
+        ranker.selection_made = False
+
+        with patch.object(ELOSystem, "save"):
+            _, changed = ranker.apply_star_action("A")
+            self.assertTrue(changed)
+            self.assertCountEqual(hall.artists, ["a", "b"])
+            self.assertEqual(hof_elo.get_rating("a"), 1500)
+            self.assertTrue(ranker.selection_made)
+
+            _, changed = ranker.apply_star_action("A")
+            self.assertTrue(changed)
+
+        self.assertNotIn("a", hall.artists)
+        self.assertIn("a", main_pool.pool)
+        self.assertEqual(main_elo.get_rating("a"), 1777)
+        self.assertFalse(ranker.selection_made)
+
+    def test_weighted_elo_is_zero_sum_and_scales_artist_influence(self):
+        winners = ["winner_high", "winner_low", "winner_mid"]
+        losers = ["loser_a", "loser_b", "loser_c"]
+        system = ELOSystem(
+            ratings={artist: 1500 for artist in winners + losers}
+        )
+        before_total = sum(system.ratings.values())
+
+        system.update_weighted_ratings(
+            winners,
+            losers,
+            [2.0, 0.5, 1.0],
+            [1.0, 1.0, 1.0],
+        )
+
+        after_total = sum(system.ratings.values())
+        self.assertAlmostEqual(before_total, after_total, places=6)
+        self.assertGreater(
+            system.get_rating("winner_high") - 1500,
+            system.get_rating("winner_low") - 1500,
+        )
+        self.assertEqual(
+            system.mode_comparisons["winner_high"][COMPARISON_MODE_WEIGHTED],
+            1,
+        )
+        self.assertEqual(system.weighted_exposure["winner_high"], 2.0)
+
+    def test_weighted_artist_prompt_uses_novelai_syntax(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        tags_file = Path(temp_dir.name) / "artists.txt"
+        tags_file.write_text("alpha\nbeta\n", encoding="utf-8")
+        manager = ArtistTagManager(
+            tags_file,
+            ELOSystem(),
+            Path(temp_dir.name) / "temporary_pool.json",
+        )
+
+        prompt = manager.format_artist_tags(["alpha", "beta"], [1.3, 0.8])
+
+        self.assertEqual(
+            prompt,
+            "1.3::artist: alpha::, 0.8::artist: beta::",
+        )
+
+    def test_broken_heart_exclusion_survives_refill(self):
+        pool, _ = self.make_pool(
+            ["a", "b", "c", "replacement"],
+            active_artists=["a", "b", "c"],
+            pool_size=3,
+        )
+
+        pool.remove_artists(["a"], permanent=True)
+        pool._refill_pool()
+
+        self.assertNotIn("a", pool.pool)
+        self.assertIn("replacement", pool.pool)
+        self.assertIn("a", pool.manual_excluded)
 
     def test_generation_settings_round_trip_all_values(self):
         settings = GenerationSettings.from_values(

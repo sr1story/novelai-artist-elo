@@ -11,15 +11,16 @@ A web-based blind comparison system that ranks Danbooru artist tags by generatin
 - **ELO Rating System**: Individual-based ELO calculation with zero-sum enforcement
 - **Active Pool Management**: Moves between roughly 150-200 artists for efficient discovery and replacement
 - **Smart Rotation**: Low performers are probabilistically rotated out; high ELO artists are more likely to return
-- **Ranking Directions**: Switch between balanced, newcomer, top-rank refinement, and replacement workflows without resetting ELO data
-- **Win Rate Statistics**: Track solo, duo, and trio performance for each artist
+- **Two Independent Pools**: Keep a main-pool ELO and a separate Hall of Fame ELO
+- **Hall of Fame Controls**: Use image-level star and broken-heart controls to promote, restore, or exclude complete artist combinations
+- **Hall of Fame Modes**: Compare Hall of Fame artists as solo tags or normal 1-3 artist combinations
+- **Weighted Combination Lab**: Compare disjoint 3-10 artist Hall of Fame teams with NovelAI weights from 0.5 to 2.0
 - **Undo Support**: Revert the last comparison if you change your mind
-- **Keyboard Shortcuts**: Quick voting with `1`, `2`, `s` (skip), and `0` (undo)
 - **Custom Prompts**: Use your own positive and negative prompts
 - **NovelAI-Style Settings**: Resolution, steps, guidance, seed, sampler, Variety+, guidance rescale, noise schedule, quality tags, and UC presets
 - **Fair Pair Seeds**: Both images use the same seed in each comparison to reduce luck-based differences
 - **Prompt Presets**: Save and reload the prompt, negative prompt, and every image setting in 10 persistent slots
-- **Temporary Artist Discovery**: Extract known artist tags from pasted text and compare them without changing the active pool
+- **Temporary Artist Intake**: Extract known artist tags from pasted text, force one into each normal combination, and automatically add evaluated artists to the main pool
 - **Anlas Balance**: Show the current NovelAI Anlas balance without external purchase links
 - **Export to CSV**: Download full leaderboard with detailed stats
 - **Comparison History**: View your last 10 comparison results
@@ -91,16 +92,14 @@ See **[MOBILE_DEPLOY.md](MOBILE_DEPLOY.md)** for the Korean phone-only deploymen
 
    ![Comparison View](screenshots/picker.png)
 
-   - Click "Pick Image A" or "Pick Image B" to vote for your preferred image
-   - Use keyboard shortcuts for faster voting:
-     - `1` - Pick Image A
-     - `2` - Pick Image B
-     - `s` - Skip (no ELO changes, generates new pair)
-     - `0` - Undo last selection
+   - Tap **A 선택** or **B 선택** to vote for your preferred image
+   - Use **건너뛰기 / 새 비교** to generate a new pair without changing ELO
+   - Use **마지막 선택 되돌리기** to restore the prior vote and pair
+   - Switch between the **랭킹** and **가중치 조합** tabs without losing either page's current images
 
 4. **View rankings**
 
-   The leaderboard on the right shows the top artists by ELO rating, along with their win rates and comparison counts.
+   The ranking panel shows the selected pool's own ELO and comparison counts. Main-pool and Hall of Fame ratings never overwrite each other.
 
    <img src="screenshots/leaderboard.png" width="350">
 
@@ -108,58 +107,41 @@ See **[MOBILE_DEPLOY.md](MOBILE_DEPLOY.md)** for the Korean phone-only deploymen
 
 Each artist entry shows:
 ```
-1. artist_name 1650 — 72% (25)
-   S:80%(5) D:70%(12) T:67%(8)
+1. artist_name 1650 · 25회
 ```
 
 - **1650** - Current ELO rating
-- **72% (25)** - Overall win rate (total comparisons)
-- **S:80%(5)** - Solo win rate: 80% when used alone (5 solo comparisons)
-- **D:70%(12)** - Duo win rate: 70% when paired with 1 other artist (12 duo comparisons)
-- **T:67%(8)** - Trio win rate: 67% when in a group of 3 artists (8 trio comparisons)
+- **25회** - Comparisons recorded in the currently selected ELO pool
 
-This breakdown helps identify artists who perform better alone vs. in combinations.
+### Two Pools and Image Actions
 
-### Ranking Direction
+Choose **전체 작가 풀** or **명예의 전당** above the ranking images.
 
-Use the **Ranking Direction** dropdown above the comparison images to change which
-artists are more likely to appear. The ELO formula, rankings, history, and two-image
-workflow stay the same when the direction changes.
+- In the main pool, `☆` moves every artist used by that image into the Hall of Fame. Their Hall of Fame ELO and comparison count start again at 1500 and zero, while the existing main ELO is preserved.
+- A filled `★` returns those artists to the main pool and restores the preserved main ELO. Entering the Hall of Fame again always starts a new 1500-point Hall of Fame run.
+- The empty broken-heart control excludes every artist used by that main-pool image from future automatic main-pool selection. It is not shown in the Hall of Fame.
+- Pool actions resolve the current image pair without generating another image. Use the new-comparison button when ready, avoiding an unintended NovelAI charge.
 
-| Direction | Focus |
-|-----------|-------|
-| **Balanced** | Existing 1-3 artist combinations, with a mild preference for artists with fewer comparisons |
-| **Newcomer** | Below 200 active artists, compare two never-rated artists outside the pool as solo tags and add both after voting. At 200 or more, compare at-risk pool artists as solos and remove the loser |
-| **Top-Rank Refinement** | Focus 70% of selections on the top 30% of artists with at least 5 comparisons, while keeping 30% balanced coverage |
-| **Replacement** | Above 150 active artists, compare the two lowest-ELO pool artists as solos regardless of comparison count and remove the loser. At 150 or fewer, compare two artists outside the pool as solos and add both after voting |
+### Hall of Fame and Weighted Modes
 
-If fewer than two at-risk artists have enough data, Newcomer uses a solo calibration
-comparison without changing pool membership. Replacement always has two candidates
-while the pool is above 150. Removing an artist
-only removes them from the active pool; it does not delete their ELO rating or
-comparison history. The selected direction is stored in `active_pool.json` and
-survives restarts.
+The first page offers two Hall of Fame comparison modes:
 
-### ELO Candidate Rules
+- **단일 작가**: one Hall of Fame artist per image
+- **일반 조합**: one to three Hall of Fame artists per image
 
-The **Comparison Candidate Rule** dropdown works independently from Ranking
-Direction. During ordinary comparisons it spends about 80% of selections on
-artists matching the chosen rule and keeps about 20% broad coverage. Explicit
-Newcomer/Replacement pool-growth or pool-trimming rounds still take priority so
-the active-pool boundaries remain predictable.
+The second page builds two non-overlapping Hall of Fame teams. Each side contains
+the selected 3-10 artists and uses the same total prompt weight, with individual
+weights sampled from 0.5 to 2.0. Generated tags use NovelAI syntax:
 
-| Candidate rule | Definition |
-|----------------|------------|
-| **All · Auto** | Preserve the existing comparison-count weighting across the active pool |
-| **Familiar** | Artists with at least 10 comparisons |
-| **New** | Artists with fewer than 5 comparisons |
-| **Dark Horse** | Artists with 5-9 comparisons and ELO at or above the active-pool average |
-| **Proven** | Artists with at least 10 comparisons and ELO in the active-pool top 25% |
+```text
+1.3::artist: alpha::, 0.8::artist: beta::, 1.1::artist: gamma::
+```
 
-The leaderboard displays the same labels beside artists. Artists with 5-9
-comparisons below the pool average are shown as **Exploring** until they qualify
-for another label. The selected candidate rule is also stored in
-`active_pool.json` and survives restarts.
+Hall of Fame ELO affects which artists are grouped together. The effective team
+rating is the prompt-weighted average ELO, and the result gives a bounded larger
+share of credit or blame to higher-weight artists while keeping the total ELO
+change zero-sum. A 3-vs-3 comparison needs at least six Hall of Fame artists;
+10-vs-10 needs twenty.
 
 ### Temporary Artist Discovery
 
@@ -171,36 +153,22 @@ only exact matches from the bundled artist tag file, accepts `artist: name`,
 prompt-weight wrappers, and space/underscore variants, removes duplicates, and
 discards every unregistered or non-artist segment.
 
-After at least two artists are recognized, start the temporary pool. Temporary
-comparisons are always solo-vs-solo for clear attribution. Votes still update the
-global ELO ratings and comparison history, but active-pool additions, removals,
-and rotations are completely disabled. Stopping the temporary pool returns future
-comparisons to the existing active pool without deleting the cleaned list or the
-currently displayed comparison. The list and enabled state are stored separately
-in `temporary_pool.json` so a mobile server restart does not lose the session.
+After at least two artists are recognized, start temporary intake. Every following
+main-pool A/B combination contains at least one distinct temporary artist, while
+the remaining positions may contain normal main-pool artists. Combination sizes
+remain 1-3, so a natural solo result is still possible.
+
+After a vote, the temporary artists used on both sides are automatically added to
+the main pool and removed from the temporary queue. Their first main ELO result is
+that vote; an already-rated artist keeps its stored main ELO. Undo restores both
+the rating and temporary queue. Stopping intake keeps the cleaned list for later.
+The list and enabled state are stored in `temporary_pool.json`.
 
 ### Pool Health & Statistics
 
-The statistics panel shows the current state of your artist pool and ranking progress.
-
-<img src="screenshots/stats.png" width="400">
-
-- **Comparisons**: Total number of comparisons made
-- **Artists rated**: How many unique artists have been evaluated
-- **Pool**: Current active pool size vs total available artists
-- **Pool out**: Rated artists that are not currently in the active pool; artists never evaluated are not counted
-- **Pool Health**: Breakdown of artists above/below average and newcomers (<5 matches)
-- **Most likely to rotate out**: Artists at risk of being removed from the pool
-
-### Pool Changes
-
-The "Pool Changes" section (below Pool Health) shows recent artist rotations, newest first:
-
-<img src="screenshots/pool_changes.png" width="350">
-
-- **Bold names with [new]**: Artists newly added to the pool
-- **Bold names with [returning]**: Previously rated artists returning to the pool
-- **~~Strikethrough names~~**: Artists removed from the pool
+The badge above each image pair shows the main-pool count, Hall of Fame count,
+rated artists currently outside both pools, and remaining temporary intake count.
+The ranking panel reports the selected pool's comparison total and top 30 members.
 
 ### Export to CSV
 
@@ -208,11 +176,11 @@ Click "Export Leaderboard as CSV" to download the full leaderboard as a CSV file
 
 <img src="screenshots/export_leaderboard.png" width="400">
 
-- Rank, Artist, candidate label, active/out status, ELO, Total Comparisons
-- Wins, Losses, Win Rate
-- Solo rounds/wins/win rate
-- Duo rounds/wins/win rate
-- Trio rounds/wins/win rate
+- Main rank, artist, and current membership (`main`, `hall_of_fame`, or `out`)
+- Main ELO/comparisons and separate Hall of Fame ELO/comparisons
+- Wins, losses, and win rate
+- Solo, normal, and weighted-mode appearance counts
+- Average prompt weight used in weighted Hall of Fame comparisons
 
 The export includes ALL rated artists (not just the top 30 shown in the UI).
 
@@ -335,6 +303,10 @@ The system uses an individual-based ELO calculation:
 4. **Zero-Sum**: Total ELO gained equals total ELO lost (scaled for fairness)
 5. **Pool Rotation**: Underperformers may be rotated out; high-ELO artists are more likely to return
 
+Hall of Fame comparisons use a different ELO file. Weighted comparisons replace
+the opposing team's simple average with a prompt-weighted average and scale each
+artist's bounded influence by its 0.5-2.0 prompt weight.
+
 **Note:** If the same artist appears on both sides of a comparison, they are excluded from ELO changes (they can't win or lose against themselves). Skipping a comparison also results in no ELO changes.
 
 ### Pool Rotation Strategy
@@ -344,8 +316,7 @@ The system uses an individual-based ELO calculation:
   - Underperformance: relative to pool's best performer
 - **Addition Weight**: `(ELO - min_ELO + 100)²`
   - Squared preference for high-ELO artists
-- **Directional Pool Band**: Newcomer grows the pool toward 200; Replacement shrinks it toward 150
-- **Hard Cap**: The pool stays bounded at 201, allowing a two-artist addition to cross the 200 boundary once
+- **Explicit exclusions**: Broken-heart artists and current Hall of Fame members are not eligible for automatic main-pool refill
 
 ## Data Files
 
@@ -353,11 +324,14 @@ The application creates/uses several JSON files:
 
 | File | Purpose |
 |------|---------|
-| `artist_elo_ratings.json` | ELO ratings and comparison counts |
-| `active_pool.json` | Current active pool, ranking direction, and candidate rule |
-| `temporary_pool.json` | Isolated pasted artist list and temporary-pool enabled state |
+| `artist_elo_ratings.json` | Main-pool ELO ratings and comparison counts |
+| `active_pool.json` | Main-pool membership and explicit broken-heart exclusions |
+| `hall_of_fame_pool.json` | Current Hall of Fame membership |
+| `hall_of_fame_elo_ratings.json` | Independent Hall of Fame ELO, mode counts, and weighted exposure |
+| `temporary_pool.json` | Pasted artist intake queue and enabled state |
 | `prompt_presets.json` | Ten prompt and image-setting preset slots |
 | `current_comparison.json` | Current images, actual pair seed, and generation settings |
+| `weighted_comparison.json` | Independent current weighted-page images, artists, and prompt weights |
 | `comparison_history.json` | Full history of all comparisons |
 
 These files are automatically created on first run and persist your rankings across sessions.
@@ -378,7 +352,10 @@ novelai-artist-elo/
 ├── comparison_images/       # Generated images (auto-created)
 ├── artist_elo_ratings.json  # ELO data (auto-created)
 ├── active_pool.json         # Pool data (auto-created)
-├── temporary_pool.json      # Temporary discovery pool (auto-created)
+├── hall_of_fame_pool.json   # Hall of Fame membership (auto-created)
+├── hall_of_fame_elo_ratings.json # Hall of Fame ELO (auto-created)
+├── temporary_pool.json      # Temporary intake queue (auto-created)
+├── weighted_comparison.json # Weighted-page state (auto-created)
 └── comparison_history.json  # History (auto-created)
 ```
 
@@ -386,8 +363,8 @@ novelai-artist-elo/
 
 - **Start with more comparisons**: New artists need ~5 comparisons before they can be confidently rotated out
 - **Use consistent prompts**: Changing prompts mid-session can affect rating fairness
-- **Check pool health**: The "Pool Health" section shows at-risk artists and newcomers
-- **Review pool changes**: See which artists were recently added or removed from the pool
+- **Build the Hall gradually**: Weighted mode needs at least six Hall of Fame artists
+- **Keep team sizes equal**: The weighted page automatically uses equal artist counts and total prompt weight on both sides
 
 ## Troubleshooting
 

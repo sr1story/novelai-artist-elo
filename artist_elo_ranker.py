@@ -8,6 +8,8 @@ based on the outcomes.
 """
 
 import asyncio
+import csv
+import io
 import json
 import math
 import random
@@ -42,8 +44,11 @@ from config import (
     COMPARISON_HISTORY_FILE,
     ACTIVE_POOL_FILE,
     CURRENT_COMPARISON_FILE,
+    WEIGHTED_COMPARISON_FILE,
     PROMPT_PRESETS_FILE,
     TEMPORARY_POOL_FILE,
+    HALL_OF_FAME_POOL_FILE,
+    HALL_OF_FAME_ELO_FILE,
     STEPS,
     IMG_WIDTH,
     IMG_HEIGHT,
@@ -486,12 +491,36 @@ MOBILE_CSS = """
 }
 
 .image-card {
+    position: relative;
     min-width: 0 !important;
     border: 1px solid var(--border-color-primary);
     border-radius: 18px;
     padding: .65rem;
     background: var(--block-background-fill);
     box-shadow: var(--block-shadow);
+}
+
+.image-action-row {
+    position: absolute !important;
+    top: .9rem;
+    right: .9rem;
+    z-index: 12;
+    width: auto !important;
+    gap: .35rem !important;
+    padding: .25rem;
+    border: 1px solid rgba(255, 255, 255, .18);
+    border-radius: 999px;
+    background: rgba(10, 13, 28, .78);
+    backdrop-filter: blur(10px);
+}
+
+.image-action-row button {
+    min-width: 42px !important;
+    width: 42px !important;
+    height: 42px !important;
+    padding: 0 !important;
+    border-radius: 999px !important;
+    font-size: 1.35rem !important;
 }
 
 .comparison-image img {
@@ -502,7 +531,8 @@ MOBILE_CSS = """
     border-radius: 12px;
 }
 
-#vote-dock {
+#vote-dock,
+#weighted-vote-dock {
     position: sticky;
     bottom: max(.5rem, env(safe-area-inset-bottom));
     z-index: 20;
@@ -516,7 +546,8 @@ MOBILE_CSS = """
     box-shadow: 0 12px 32px rgba(0, 0, 0, .18);
 }
 
-#vote-a, #vote-b {
+#vote-a, #vote-b,
+#weighted-vote-dock button {
     min-height: 54px;
     font-size: 1rem;
     font-weight: 750;
@@ -557,12 +588,14 @@ MOBILE_CSS = """
     }
 
     #main-layout,
-    #comparison-row {
+    #comparison-row,
+    #weighted-comparison-row {
         flex-direction: column !important;
     }
 
     #main-layout > div,
-    #comparison-row > div {
+    #comparison-row > div,
+    #weighted-comparison-row > div {
         width: 100% !important;
         min-width: 0 !important;
     }
@@ -572,7 +605,8 @@ MOBILE_CSS = """
         border-radius: 14px;
     }
 
-    #vote-dock {
+    #vote-dock,
+    #weighted-vote-dock {
         margin-left: -.25rem;
         margin-right: -.25rem;
         padding: .55rem;
@@ -677,6 +711,26 @@ POOL_ACTION_TRIM_TO_150 = "trim_to_150"
 POOL_ACTION_REFILL_FROM_150 = "refill_from_150"
 POOL_ACTION_TEMPORARY = "temporary_pool"
 
+POOL_CONTEXT_MAIN = "main"
+POOL_CONTEXT_HALL = "hall_of_fame"
+COMPARISON_MODE_NORMAL = "normal"
+COMPARISON_MODE_SOLO = "solo"
+COMPARISON_MODE_WEIGHTED = "weighted"
+
+POOL_CONTEXT_CHOICES = [
+    ("전체 작가 풀", POOL_CONTEXT_MAIN),
+    ("명예의 전당", POOL_CONTEXT_HALL),
+]
+HALL_MODE_CHOICES = [
+    ("일반 조합 · 1~3명", COMPARISON_MODE_NORMAL),
+    ("단일 작가 · 1명", COMPARISON_MODE_SOLO),
+]
+WEIGHTED_MIN_ARTISTS = 3
+WEIGHTED_MAX_ARTISTS = 10
+WEIGHT_MIN = 0.5
+WEIGHT_MAX = 2.0
+WEIGHT_STEP = 0.1
+
 
 def normalize_ranking_mode(mode: str) -> str:
     """Return a supported ranking mode, falling back to the existing strategy."""
@@ -722,7 +776,10 @@ def get_pool_action_status(pool_action: str) -> str:
     if pool_action == POOL_ACTION_CALIBRATE_SOLO:
         return "교체 후보 판정을 위한 단일 비교입니다. 이번 비교에서는 풀을 교체하지 않습니다."
     if pool_action == POOL_ACTION_TEMPORARY:
-        return "임시 풀 단독 비교입니다. ELO와 기록만 저장되며 활성 풀은 변경되지 않습니다."
+        return (
+            "양쪽 조합에 임시 작가가 포함되었습니다. "
+            "투표가 끝나면 사용된 임시 작가가 전체 풀에 편입됩니다."
+        )
     return "이미지가 생성되었습니다. 더 마음에 드는 쪽을 선택하세요."
 
 
@@ -736,6 +793,8 @@ class ELOSystem:
     ratings: dict = field(default_factory=dict)
     comparison_count: int = 0
     artist_comparisons: dict = field(default_factory=dict)  # Track per-artist comparisons
+    mode_comparisons: dict = field(default_factory=dict)
+    weighted_exposure: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, filepath: Path) -> "ELOSystem":
@@ -747,17 +806,31 @@ class ELOSystem:
                 system.ratings = data.get("ratings", {})
                 system.comparison_count = data.get("comparison_count", 0)
                 system.artist_comparisons = data.get("artist_comparisons", {})
+                system.mode_comparisons = data.get("mode_comparisons", {})
+                system.weighted_exposure = data.get("weighted_exposure", {})
                 return system
         return cls()
 
     def save(self, filepath: Path):
         """Save ELO ratings to file."""
-        with open(filepath, "w", encoding="utf-8") as f:
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = filepath.with_suffix(".tmp")
+        with open(temp_file, "w", encoding="utf-8") as f:
             json.dump({
                 "ratings": self.ratings,
                 "comparison_count": self.comparison_count,
-                "artist_comparisons": self.artist_comparisons
+                "artist_comparisons": self.artist_comparisons,
+                "mode_comparisons": self.mode_comparisons,
+                "weighted_exposure": self.weighted_exposure,
             }, f, indent=2)
+        temp_file.replace(filepath)
+
+    def reset_artist(self, artist: str):
+        """Start a fresh rating run for one artist in this ELO system."""
+        self.ratings[artist] = float(DEFAULT_ELO)
+        self.artist_comparisons[artist] = 0
+        self.mode_comparisons[artist] = {}
+        self.weighted_exposure[artist] = 0.0
 
     def get_rating(self, artist: str) -> float:
         """Get ELO rating for an artist, defaulting to DEFAULT_ELO."""
@@ -769,11 +842,58 @@ class ELOSystem:
             return DEFAULT_ELO
         return sum(self.get_rating(a) for a in artists) / len(artists)
 
+    def get_weighted_combined_rating(
+        self,
+        artists: List[str],
+        weights: List[float],
+    ) -> float:
+        """Return the prompt-weighted average ELO for a combination."""
+        if not artists:
+            return DEFAULT_ELO
+        normalized_weights = [
+            max(WEIGHT_MIN, min(WEIGHT_MAX, float(weight)))
+            for weight in weights[:len(artists)]
+        ]
+        if len(normalized_weights) < len(artists):
+            normalized_weights.extend(
+                [1.0] * (len(artists) - len(normalized_weights))
+            )
+        total_weight = sum(normalized_weights)
+        if total_weight <= 0:
+            return self.get_combined_rating(artists)
+        return sum(
+            self.get_rating(artist) * weight
+            for artist, weight in zip(artists, normalized_weights)
+        ) / total_weight
+
     def calculate_expected_score(self, rating_a: float, rating_b: float) -> float:
         """Calculate expected score for player A against player B."""
         return 1 / (1 + 10 ** ((rating_b - rating_a) / 400))
 
-    def update_ratings(self, winners: List[str], losers: List[str]):
+    def _record_artist_comparison(
+        self,
+        artist: str,
+        mode: str,
+        weighted_exposure: float = 0.0,
+    ):
+        self.artist_comparisons[artist] = (
+            self.artist_comparisons.get(artist, 0) + 1
+        )
+        mode_counts = self.mode_comparisons.setdefault(artist, {})
+        mode_counts[mode] = mode_counts.get(mode, 0) + 1
+        if weighted_exposure:
+            self.weighted_exposure[artist] = round(
+                float(self.weighted_exposure.get(artist, 0.0))
+                + float(weighted_exposure),
+                4,
+            )
+
+    def update_ratings(
+        self,
+        winners: List[str],
+        losers: List[str],
+        mode: str = COMPARISON_MODE_NORMAL,
+    ):
         """
         Update ELO ratings after a comparison.
         Uses INDIVIDUAL-based calculation: each artist's gain/loss is based on
@@ -826,12 +946,96 @@ class ELOSystem:
         # Apply changes
         for artist, change in winner_changes:
             self.ratings[artist] = self.get_rating(artist) + change
-            self.artist_comparisons[artist] = self.artist_comparisons.get(artist, 0) + 1
+            self._record_artist_comparison(artist, mode)
 
         for artist, change in loser_changes:
             scaled_change = change * scale_factor
             self.ratings[artist] = self.get_rating(artist) + scaled_change
-            self.artist_comparisons[artist] = self.artist_comparisons.get(artist, 0) + 1
+            self._record_artist_comparison(artist, mode)
+
+        self.comparison_count += 1
+
+    def update_weighted_ratings(
+        self,
+        winners: List[str],
+        losers: List[str],
+        winner_weights: List[float],
+        loser_weights: List[float],
+    ):
+        """Update a HOF comparison while scaling credit by prompt weights."""
+        overlap = set(winners) & set(losers)
+        actual_winners = [artist for artist in winners if artist not in overlap]
+        actual_losers = [artist for artist in losers if artist not in overlap]
+        if not actual_winners or not actual_losers:
+            self.comparison_count += 1
+            return
+
+        winner_weight_map = {
+            artist: max(WEIGHT_MIN, min(WEIGHT_MAX, float(weight)))
+            for artist, weight in zip(winners, winner_weights)
+        }
+        loser_weight_map = {
+            artist: max(WEIGHT_MIN, min(WEIGHT_MAX, float(weight)))
+            for artist, weight in zip(losers, loser_weights)
+        }
+        winner_team_rating = self.get_weighted_combined_rating(
+            winners,
+            [winner_weight_map.get(artist, 1.0) for artist in winners],
+        )
+        loser_team_rating = self.get_weighted_combined_rating(
+            losers,
+            [loser_weight_map.get(artist, 1.0) for artist in losers],
+        )
+
+        winner_average_weight = sum(
+            winner_weight_map.get(artist, 1.0) for artist in actual_winners
+        ) / len(actual_winners)
+        loser_average_weight = sum(
+            loser_weight_map.get(artist, 1.0) for artist in actual_losers
+        ) / len(actual_losers)
+
+        winner_changes = []
+        for artist in actual_winners:
+            current = self.get_rating(artist)
+            expected = self.calculate_expected_score(current, loser_team_rating)
+            influence = max(
+                0.5,
+                min(1.5, winner_weight_map.get(artist, 1.0) / winner_average_weight),
+            )
+            winner_changes.append((artist, K_FACTOR * (1 - expected) * influence))
+
+        loser_changes = []
+        for artist in actual_losers:
+            current = self.get_rating(artist)
+            expected = self.calculate_expected_score(current, winner_team_rating)
+            influence = max(
+                0.5,
+                min(1.5, loser_weight_map.get(artist, 1.0) / loser_average_weight),
+            )
+            loser_changes.append((artist, K_FACTOR * (0 - (1 - expected)) * influence))
+
+        total_winner_gain = sum(change for _, change in winner_changes)
+        total_loser_loss = sum(change for _, change in loser_changes)
+        loser_scale = (
+            -total_winner_gain / total_loser_loss
+            if total_loser_loss
+            else 1.0
+        )
+
+        for artist, change in winner_changes:
+            self.ratings[artist] = self.get_rating(artist) + change
+            self._record_artist_comparison(
+                artist,
+                COMPARISON_MODE_WEIGHTED,
+                winner_weight_map.get(artist, 1.0),
+            )
+        for artist, change in loser_changes:
+            self.ratings[artist] = self.get_rating(artist) + change * loser_scale
+            self._record_artist_comparison(
+                artist,
+                COMPARISON_MODE_WEIGHTED,
+                loser_weight_map.get(artist, 1.0),
+            )
 
         self.comparison_count += 1
 
@@ -882,6 +1086,8 @@ class ActivePool:
         self.pool_size = pool_size
         self.pool_file = pool_file or ACTIVE_POOL_FILE
         self.pool: List[str] = []
+        self.manual_excluded = set()
+        self.hall_of_fame = set()
         self.ranking_mode = RANKING_MODE_BALANCED
         self.candidate_rule = CANDIDATE_RULE_AUTO
         self.load()
@@ -892,6 +1098,11 @@ class ActivePool:
             with open(self.pool_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 self.pool = data.get("pool", [])
+                self.manual_excluded = {
+                    artist
+                    for artist in data.get("manual_excluded", [])
+                    if artist in self.all_artists
+                }
                 self.ranking_mode = normalize_ranking_mode(
                     data.get("ranking_mode", RANKING_MODE_BALANCED)
                 )
@@ -899,7 +1110,12 @@ class ActivePool:
                     data.get("candidate_rule", CANDIDATE_RULE_AUTO)
                 )
                 # Validate pool members still exist in all_artists
-                self.pool = [a for a in self.pool if a in self.all_artists]
+                self.pool = [
+                    artist
+                    for artist in self.pool
+                    if artist in self.all_artists
+                    and artist not in self.manual_excluded
+                ]
 
         # Initialize or refill pool if needed
         if len(self.pool) < self.pool_size:
@@ -910,6 +1126,7 @@ class ActivePool:
         with open(self.pool_file, "w", encoding="utf-8") as f:
             json.dump({
                 "pool": self.pool,
+                "manual_excluded": sorted(self.manual_excluded),
                 "ranking_mode": self.ranking_mode,
                 "candidate_rule": self.candidate_rule,
             }, f, indent=2)
@@ -940,13 +1157,71 @@ class ActivePool:
 
     def _refill_pool(self):
         """Fill pool up to pool_size with random artists not already in pool."""
-        available = [a for a in self.all_artists if a not in self.pool]
+        blocked = self.manual_excluded | self.hall_of_fame
+        available = [
+            artist
+            for artist in self.all_artists
+            if artist not in self.pool and artist not in blocked
+        ]
         needed = self.pool_size - len(self.pool)
         if needed > 0 and available:
             new_artists = random.sample(available, min(needed, len(available)))
             self.pool.extend(new_artists)
             print(f"Added {len(new_artists)} new artists to active pool. Pool size: {len(self.pool)}")
         self.save()
+
+    def set_hall_of_fame(self, artists: List[str], refill: bool = True):
+        """Exclude HOF members from main-pool sampling without losing main ELO."""
+        self.hall_of_fame = {
+            artist for artist in artists if artist in self.all_artists
+        }
+        self.pool = [
+            artist for artist in self.pool
+            if artist not in self.hall_of_fame
+        ]
+        if refill and len(self.pool) < self.pool_size:
+            self._refill_pool()
+        else:
+            self.save()
+
+    def remove_artists(
+        self,
+        artists: List[str],
+        permanent: bool = False,
+    ) -> List[Tuple[str, float]]:
+        """Remove explicit artists and optionally keep them out of auto-rotation."""
+        removed = []
+        for artist in dict.fromkeys(artists):
+            if artist in self.pool:
+                self.pool.remove(artist)
+                removed.append((artist, self.elo_system.get_rating(artist)))
+            if permanent and artist in self.all_artists:
+                self.manual_excluded.add(artist)
+        self.save()
+        return removed
+
+    def add_artists(
+        self,
+        artists: List[str],
+        clear_exclusion: bool = True,
+    ) -> List[Tuple[str, float, bool]]:
+        """Explicitly add known artists to the main pool."""
+        added = []
+        for artist in dict.fromkeys(artists):
+            if artist not in self.all_artists or artist in self.hall_of_fame:
+                continue
+            if clear_exclusion:
+                self.manual_excluded.discard(artist)
+            if artist not in self.pool:
+                is_returning = (
+                    self.elo_system.get_artist_comparison_count(artist) > 1
+                )
+                self.pool.append(artist)
+                added.append(
+                    (artist, self.elo_system.get_rating(artist), is_returning)
+                )
+        self.save()
+        return added
 
     def get_selection_weight(self, artist: str) -> float:
         """
@@ -1319,7 +1594,12 @@ class ActivePool:
             POOL_ACTION_REFILL_FROM_150,
         }:
             for artist in dict.fromkeys(winners + losers):
-                if artist in self.all_artists and artist not in self.pool:
+                if (
+                    artist in self.all_artists
+                    and artist not in self.pool
+                    and artist not in self.manual_excluded
+                    and artist not in self.hall_of_fame
+                ):
                     self.pool.append(artist)
                     elo = self.elo_system.get_rating(artist)
                     is_returning = (
@@ -1410,7 +1690,12 @@ class ActivePool:
         # Maybe introduce new artist, weighted by ELO (squared for stronger preference)
         # Higher ELO = much higher chance of being added back
         if random.random() < addition_prob:
-            available = [a for a in self.all_artists if a not in self.pool]
+            blocked = self.manual_excluded | self.hall_of_fame
+            available = [
+                artist
+                for artist in self.all_artists
+                if artist not in self.pool and artist not in blocked
+            ]
             if available:
                 # Newcomer mode spends 70% of its focused additions on artists
                 # that have never received an ELO result. The remaining 30%
@@ -1479,7 +1764,12 @@ class ActivePool:
     def restore_artists(self, artists: List[str]):
         """Restore artists to the pool (for undo)."""
         for artist in artists:
-            if artist not in self.pool and artist in self.all_artists:
+            if (
+                artist not in self.pool
+                and artist in self.all_artists
+                and artist not in self.hall_of_fame
+            ):
+                self.manual_excluded.discard(artist)
                 self.pool.append(artist)
         self.save()
 
@@ -1489,7 +1779,11 @@ class ActivePool:
             if artist in self.pool:
                 self.pool.remove(artist)
         for artist in rotated_out:
-            if artist not in self.pool and artist in self.all_artists:
+            if (
+                artist not in self.pool
+                and artist in self.all_artists
+                and artist not in self.hall_of_fame
+            ):
                 self.pool.append(artist)
         self.save()
 
@@ -1500,7 +1794,9 @@ class ActivePool:
             for artist in self.elo_system.ratings
             if artist in self.all_artists
         }
-        out_count = len(evaluated_artists - set(self.pool))
+        out_count = len(
+            evaluated_artists - set(self.pool) - self.hall_of_fame
+        )
 
         if not self.pool:
             return {"size": 0, "avg_comparisons": 0, "avg_elo": DEFAULT_ELO,
@@ -1570,6 +1866,192 @@ class ActivePool:
 # --------------------------------------------------------------------------------
 # Artist Tag Management
 # --------------------------------------------------------------------------------
+
+class HallOfFamePool:
+    """Persist HOF membership and select comparisons using a separate ELO."""
+
+    def __init__(
+        self,
+        all_artists: List[str],
+        elo_system: ELOSystem,
+        main_pool: ActivePool,
+        pool_file: Path = None,
+    ):
+        self.all_artists = all_artists
+        self._artist_set = set(all_artists)
+        self.elo_system = elo_system
+        self.main_pool = main_pool
+        self.pool_file = pool_file or HALL_OF_FAME_POOL_FILE
+        self.artists: List[str] = []
+        self.load()
+        self.main_pool.set_hall_of_fame(self.artists)
+
+    def load(self):
+        if not self.pool_file.exists():
+            return
+        try:
+            with open(self.pool_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            raw_artists = data.get("artists", []) if isinstance(data, dict) else []
+            self.artists = list(dict.fromkeys(
+                artist
+                for artist in raw_artists
+                if artist in self._artist_set
+            ))
+        except (OSError, TypeError, json.JSONDecodeError) as exc:
+            print(f"Could not restore Hall of Fame: {exc}")
+
+    def save(self):
+        self.pool_file.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = self.pool_file.with_suffix(".tmp")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "artists": self.artists}, f, indent=2)
+        temp_file.replace(self.pool_file)
+
+    def induct(self, artists: List[str]) -> List[str]:
+        """Move artists from the main pool and reset their HOF run to 1500."""
+        inducted = []
+        for artist in dict.fromkeys(artists):
+            if artist not in self._artist_set or artist in self.artists:
+                continue
+            self.main_pool.manual_excluded.discard(artist)
+            self.main_pool.remove_artists([artist], permanent=False)
+            self.artists.append(artist)
+            self.elo_system.reset_artist(artist)
+            inducted.append(artist)
+        if inducted:
+            self.main_pool.set_hall_of_fame(self.artists, refill=False)
+            self.save()
+        return inducted
+
+    def return_to_main(self, artists: List[str]) -> List[str]:
+        """Restore HOF members to main membership with their preserved main ELO."""
+        returning = [
+            artist for artist in dict.fromkeys(artists)
+            if artist in self.artists
+        ]
+        if not returning:
+            return []
+        returning_set = set(returning)
+        self.artists = [
+            artist for artist in self.artists
+            if artist not in returning_set
+        ]
+        self.main_pool.set_hall_of_fame(self.artists, refill=False)
+        self.main_pool.add_artists(returning, clear_exclusion=True)
+        self.save()
+        return returning
+
+    def _selection_weight(self, artist: str) -> float:
+        comparisons = self.elo_system.get_artist_comparison_count(artist)
+        return 1.0 / (1.0 + math.sqrt(comparisons))
+
+    def _pick_artist(
+        self,
+        candidates: List[str],
+        anchor_rating: Optional[float] = None,
+    ) -> str:
+        if not candidates:
+            raise ValueError("선택할 명예의 전당 작가가 없습니다.")
+        weights = []
+        for artist in candidates:
+            exploration = self._selection_weight(artist)
+            if anchor_rating is None:
+                weights.append(exploration)
+                continue
+            elo_gap = abs(self.elo_system.get_rating(artist) - anchor_rating)
+            affinity = 1.0 / (1.0 + elo_gap / 200.0)
+            weights.append(0.7 * affinity + 0.3 * exploration)
+        return ActivePool._weighted_choice(candidates, weights)
+
+    def _sample_artists(self, count: int) -> List[str]:
+        if len(self.artists) < count:
+            raise ValueError(
+                f"명예의 전당 작가가 {count}명 이상 필요합니다. "
+                f"현재 {len(self.artists)}명입니다."
+            )
+        remaining = self.artists.copy()
+        first = self._pick_artist(remaining)
+        selected = [first]
+        remaining.remove(first)
+        anchor_rating = self.elo_system.get_rating(first)
+        while len(selected) < count:
+            artist = self._pick_artist(remaining, anchor_rating)
+            selected.append(artist)
+            remaining.remove(artist)
+            anchor_rating = self.elo_system.get_combined_rating(selected)
+        return selected
+
+    def select_pair(
+        self,
+        mode: str = COMPARISON_MODE_NORMAL,
+    ) -> Tuple[List[str], List[str]]:
+        """Select disjoint solo or 1-3 artist HOF combinations."""
+        if len(self.artists) < 2:
+            raise ValueError("명예의 전당 비교에는 작가가 최소 2명 필요합니다.")
+        if mode == COMPARISON_MODE_SOLO:
+            selected = self._sample_artists(2)
+            return [selected[0]], [selected[1]]
+
+        max_each = min(3, len(self.artists) // 2)
+        count_a = random.randint(1, max_each)
+        count_b = random.randint(1, min(3, len(self.artists) - count_a))
+        selected = self._sample_artists(count_a + count_b)
+        return selected[:count_a], selected[count_a:]
+
+    @staticmethod
+    def _make_weight_set(count: int) -> List[float]:
+        steps = int(round((WEIGHT_MAX - WEIGHT_MIN) / WEIGHT_STEP))
+        return [
+            round(WEIGHT_MIN + random.randint(0, steps) * WEIGHT_STEP, 1)
+            for _ in range(count)
+        ]
+
+    def select_weighted_pair(
+        self,
+        artists_per_side: int,
+    ) -> Tuple[List[str], List[str], List[float], List[float]]:
+        """Build balanced, disjoint HOF teams with equal total prompt weight."""
+        count = max(
+            WEIGHTED_MIN_ARTISTS,
+            min(WEIGHTED_MAX_ARTISTS, int(artists_per_side)),
+        )
+        required = count * 2
+        selected = self._sample_artists(required)
+
+        # Try several splits and keep the closest unweighted team ELO matchup.
+        best_a = selected[:count]
+        best_b = selected[count:]
+        best_gap = abs(
+            self.elo_system.get_combined_rating(best_a)
+            - self.elo_system.get_combined_rating(best_b)
+        )
+        for _ in range(60):
+            shuffled = selected.copy()
+            random.shuffle(shuffled)
+            candidate_a = shuffled[:count]
+            candidate_b = shuffled[count:]
+            gap = abs(
+                self.elo_system.get_combined_rating(candidate_a)
+                - self.elo_system.get_combined_rating(candidate_b)
+            )
+            if gap < best_gap:
+                best_a, best_b, best_gap = candidate_a, candidate_b, gap
+
+        weights_a = self._make_weight_set(count)
+        weights_b = weights_a.copy()
+        random.shuffle(weights_b)
+        return best_a, best_b, weights_a, weights_b
+
+    def get_stats(self) -> Dict[str, Any]:
+        ratings = [self.elo_system.get_rating(artist) for artist in self.artists]
+        return {
+            "size": len(self.artists),
+            "avg_elo": (
+                sum(ratings) / len(ratings) if ratings else DEFAULT_ELO
+            ),
+            "comparisons": self.elo_system.comparison_count,
+        }
 
 class ArtistTagManager:
     """Manages loading and selecting artist tags."""
@@ -1805,7 +2287,7 @@ class ArtistTagManager:
             print(f"Could not save temporary pool: {exc}")
 
     def activate_temporary_pool(self, artists: List[str]):
-        """Start isolated solo comparisons from at least two known artists."""
+        """Prioritize at least two known artists for main-pool intake."""
         canonical = list(dict.fromkeys(
             artist for artist in artists if artist in self._artist_set
         ))
@@ -1873,13 +2355,50 @@ class ArtistTagManager:
     def _get_temporary_comparison_pair(
         self,
     ) -> Tuple[List[str], List[str], str]:
-        """Return two distinct solo artists from the isolated discovery pool."""
-        first = self._select_temporary_artist(self.temporary_pool)
+        """Return normal combinations that each contain a temporary artist."""
+        blocked = (
+            self.active_pool.hall_of_fame
+            if self.active_pool
+            else set()
+        )
+        candidates = [
+            artist for artist in self.temporary_pool
+            if artist not in blocked
+        ]
+        if len(candidates) < 2:
+            self.temporary_pool_enabled = False
+            self.save_temporary_pool()
+            raise ValueError(
+                "비교 가능한 임시 작가가 2명 미만입니다. 목록을 다시 확인해 주세요."
+            )
+
+        first = self._select_temporary_artist(candidates)
         remaining = [
-            artist for artist in self.temporary_pool if artist != first
+            artist for artist in candidates if artist != first
         ]
         second = self._select_temporary_artist(remaining)
-        return [first], [second], POOL_ACTION_TEMPORARY
+
+        artists_a = [first]
+        artists_b = [second]
+        used = {first, second}
+        if self.active_pool:
+            target_a = random.randint(1, 3)
+            target_b = random.randint(1, 3)
+            for target, selected in ((target_a, artists_a), (target_b, artists_b)):
+                while len(selected) < target:
+                    pool_candidates = [
+                        artist
+                        for artist in self.active_pool.pool
+                        if artist not in used
+                    ]
+                    if not pool_candidates:
+                        break
+                    artist = self.active_pool._select_from_candidates(pool_candidates)
+                    selected.append(artist)
+                    used.add(artist)
+        random.shuffle(artists_a)
+        random.shuffle(artists_b)
+        return artists_a, artists_b, POOL_ACTION_TEMPORARY
 
     def initialize_pool(self, elo_system: ELOSystem):
         """Initialize the active pool with the ELO system."""
@@ -1921,7 +2440,32 @@ class ArtistTagManager:
     ) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float, bool]]]:
         """Process comparison result to update the active pool. Returns (rotated_out, rotated_in)."""
         if pool_action == POOL_ACTION_TEMPORARY:
-            return [], []
+            compared = set(winners + losers)
+            temporary_used = [
+                artist for artist in self.temporary_pool
+                if artist in compared
+            ]
+            rotated_in = (
+                self.active_pool.add_artists(
+                    temporary_used,
+                    clear_exclusion=True,
+                )
+                if self.active_pool
+                else []
+            )
+            used_set = set(temporary_used)
+            self.temporary_pool = [
+                artist for artist in self.temporary_pool
+                if artist not in used_set
+            ]
+            if len([
+                artist for artist in self.temporary_pool
+                if not self.active_pool
+                or artist not in self.active_pool.hall_of_fame
+            ]) < 2:
+                self.temporary_pool_enabled = False
+            self.save_temporary_pool()
+            return [], rotated_in
         if self.active_pool:
             return self.active_pool.process_result(winners, losers, pool_action)
         return [], []
@@ -1972,9 +2516,18 @@ class ArtistTagManager:
             return self.active_pool.get_pool_stats()
         return {"size": 0, "total_artists": len(self.artists)}
 
-    def format_artist_tags(self, artists: List[str]) -> str:
-        """Format artist list as comma-separated artist tags."""
-        return ", ".join(f"artist: {artist}" for artist in artists)
+    def format_artist_tags(
+        self,
+        artists: List[str],
+        weights: Optional[List[float]] = None,
+    ) -> str:
+        """Format normal or NovelAI weighted artist tags."""
+        if weights is None:
+            return ", ".join(f"artist: {artist}" for artist in artists)
+        return ", ".join(
+            f"{float(weight):.1f}::artist: {artist}::"
+            for artist, weight in zip(artists, weights)
+        )
 
 
 # --------------------------------------------------------------------------------
@@ -2175,6 +2728,50 @@ async def generate_comparison_pair(
     return None, None, [], [], POOL_ACTION_STANDARD
 
 
+async def generate_selected_comparison_pair(
+    base_prompt: str,
+    artist_manager: ArtistTagManager,
+    session: ApiCredential,
+    output_dir: Path,
+    settings: GenerationSettings,
+    pair_seed: int,
+    artists_a: List[str],
+    artists_b: List[str],
+    negative_prompt: str = None,
+    weights_a: Optional[List[float]] = None,
+    weights_b: Optional[List[float]] = None,
+    filename_prefix: str = "compare",
+) -> Tuple[Optional[Path], Optional[Path]]:
+    """Generate one explicit, optionally weighted A/B artist matchup."""
+    tags_a = artist_manager.format_artist_tags(artists_a, weights_a)
+    tags_b = artist_manager.format_artist_tags(artists_b, weights_b)
+    prompt_a = insert_artist_tags(base_prompt, tags_a)
+    prompt_b = insert_artist_tags(base_prompt, tags_b)
+
+    timestamp = int(time.time() * 1000)
+    path_a = output_dir / f"{filename_prefix}_{timestamp}_a.png"
+    path_b = output_dir / f"{filename_prefix}_{timestamp}_b.png"
+    success_a = await generate_image(
+        session,
+        prompt_a,
+        path_a,
+        settings,
+        pair_seed,
+        negative_prompt,
+    )
+    success_b = await generate_image(
+        session,
+        prompt_b,
+        path_b,
+        settings,
+        pair_seed,
+        negative_prompt,
+    )
+    if success_a and success_b:
+        return path_a, path_b
+    return None, None
+
+
 # --------------------------------------------------------------------------------
 # Comparison History
 # --------------------------------------------------------------------------------
@@ -2190,6 +2787,10 @@ class ComparisonRecord:
     image_b_path: str
     generation_settings: Dict[str, Any] = field(default_factory=dict)
     pair_seed: Optional[int] = None
+    pool_context: str = POOL_CONTEXT_MAIN
+    comparison_mode: str = COMPARISON_MODE_NORMAL
+    weights_a: List[float] = field(default_factory=list)
+    weights_b: List[float] = field(default_factory=list)
 
 
 class ComparisonHistory:
@@ -2222,70 +2823,67 @@ class ComparisonHistory:
             "image_b_path": record.image_b_path,
             "generation_settings": record.generation_settings,
             "pair_seed": record.pair_seed,
+            "pool_context": record.pool_context,
+            "comparison_mode": record.comparison_mode,
+            "weights_a": record.weights_a,
+            "weights_b": record.weights_b,
         })
         self.save()
 
     def get_artist_stats(self) -> dict:
-        """
-        Calculate stats for all artists from comparison history.
-        Returns dict of artist -> {
-            'rounds': total appearances,
-            'wins': total wins,
-            'solo': {'rounds': n, 'wins': n},
-            'duo': {'rounds': n, 'wins': n},
-            'trio': {'rounds': n, 'wins': n}
-        }
-        """
+        """Calculate backward-compatible and mode-specific history stats."""
         stats = {}
 
+        def ensure(artist: str) -> dict:
+            if artist not in stats:
+                stats[artist] = {
+                    "rounds": 0,
+                    "wins": 0,
+                    "solo": {"rounds": 0, "wins": 0},
+                    "duo": {"rounds": 0, "wins": 0},
+                    "trio": {"rounds": 0, "wins": 0},
+                    "multi": {"rounds": 0, "wins": 0},
+                    "modes": {},
+                    "weighted": {
+                        "rounds": 0,
+                        "wins": 0,
+                        "total_weight": 0.0,
+                    },
+                }
+            return stats[artist]
+
         for record in self.records:
-            artists_a = record.get("artists_a", [])
-            artists_b = record.get("artists_b", [])
             winner = record.get("winner", "")
-
-            # Determine group sizes
-            size_a = len(artists_a)
-            size_b = len(artists_b)
-
-            # Process side A
-            for artist in artists_a:
-                if artist not in stats:
-                    stats[artist] = {
-                        'rounds': 0, 'wins': 0,
-                        'solo': {'rounds': 0, 'wins': 0},
-                        'duo': {'rounds': 0, 'wins': 0},
-                        'trio': {'rounds': 0, 'wins': 0}
-                    }
-                stats[artist]['rounds'] += 1
-                won = (winner == "A")
-                if won:
-                    stats[artist]['wins'] += 1
-
-                # Track by group size
-                size_key = {1: 'solo', 2: 'duo', 3: 'trio'}.get(size_a, 'trio')
-                stats[artist][size_key]['rounds'] += 1
-                if won:
-                    stats[artist][size_key]['wins'] += 1
-
-            # Process side B
-            for artist in artists_b:
-                if artist not in stats:
-                    stats[artist] = {
-                        'rounds': 0, 'wins': 0,
-                        'solo': {'rounds': 0, 'wins': 0},
-                        'duo': {'rounds': 0, 'wins': 0},
-                        'trio': {'rounds': 0, 'wins': 0}
-                    }
-                stats[artist]['rounds'] += 1
-                won = (winner == "B")
-                if won:
-                    stats[artist]['wins'] += 1
-
-                # Track by group size
-                size_key = {1: 'solo', 2: 'duo', 3: 'trio'}.get(size_b, 'trio')
-                stats[artist][size_key]['rounds'] += 1
-                if won:
-                    stats[artist][size_key]['wins'] += 1
+            mode = record.get("comparison_mode", COMPARISON_MODE_NORMAL)
+            for side in ("A", "B"):
+                artists = record.get(f"artists_{side.lower()}", [])
+                weights = record.get(f"weights_{side.lower()}", [])
+                won = winner == side
+                size_key = {
+                    1: "solo",
+                    2: "duo",
+                    3: "trio",
+                }.get(len(artists), "multi")
+                for index, artist in enumerate(artists):
+                    artist_stats = ensure(artist)
+                    artist_stats["rounds"] += 1
+                    artist_stats[size_key]["rounds"] += 1
+                    if won:
+                        artist_stats["wins"] += 1
+                        artist_stats[size_key]["wins"] += 1
+                    mode_stats = artist_stats["modes"].setdefault(
+                        mode,
+                        {"rounds": 0, "wins": 0},
+                    )
+                    mode_stats["rounds"] += 1
+                    if won:
+                        mode_stats["wins"] += 1
+                    if mode == COMPARISON_MODE_WEIGHTED:
+                        weight = float(weights[index]) if index < len(weights) else 1.0
+                        artist_stats["weighted"]["rounds"] += 1
+                        artist_stats["weighted"]["total_weight"] += weight
+                        if won:
+                            artist_stats["weighted"]["wins"] += 1
 
         return stats
 
@@ -2313,6 +2911,37 @@ class UndoState:
     prev_pool_action: str = POOL_ACTION_STANDARD
     prev_generation_settings: Dict[str, Any] = field(default_factory=dict)
     prev_pair_seed: Optional[int] = None
+    elo_context: str = POOL_CONTEXT_MAIN
+    old_total_comparisons: int = 0
+    old_mode_comparisons: dict = field(default_factory=dict)
+    old_weighted_exposure: dict = field(default_factory=dict)
+    old_mode_presence: dict = field(default_factory=dict)
+    old_exposure_presence: dict = field(default_factory=dict)
+    temporary_pool_before: List[str] = field(default_factory=list)
+    temporary_enabled_before: bool = False
+    history_timestamp: Optional[float] = None
+    prev_pool_context: str = POOL_CONTEXT_MAIN
+    prev_comparison_mode: str = COMPARISON_MODE_NORMAL
+    prev_weights_a: List[float] = field(default_factory=list)
+    prev_weights_b: List[float] = field(default_factory=list)
+
+
+@dataclass
+class WeightedComparisonState:
+    """Independent state for the second-page weighted HOF comparison."""
+    image_a: Optional[Path] = None
+    image_b: Optional[Path] = None
+    artists_a: List[str] = field(default_factory=list)
+    artists_b: List[str] = field(default_factory=list)
+    weights_a: List[float] = field(default_factory=list)
+    weights_b: List[float] = field(default_factory=list)
+    generation_settings: GenerationSettings = field(default_factory=GenerationSettings)
+    pair_seed: Optional[int] = None
+    selection_made: bool = False
+    undo_state: Optional[UndoState] = None
+    side_actions: Dict[str, Optional[str]] = field(
+        default_factory=lambda: {"A": None, "B": None}
+    )
 
 
 class ArtistELORanker:
@@ -2325,9 +2954,18 @@ class ArtistELORanker:
         COMPARISON_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
         self.elo_system = ELOSystem.load(ELO_RATINGS_FILE)
+        self.hall_elo_system = ELOSystem.load(HALL_OF_FAME_ELO_FILE)
         self.artist_manager = ArtistTagManager(ARTIST_TAGS_FILE)
         # Initialize the active pool with ELO system
         self.artist_manager.initialize_pool(self.elo_system)
+        # The simplified main ranking always uses the original balanced logic.
+        self.artist_manager.set_ranking_mode(RANKING_MODE_BALANCED)
+        self.artist_manager.set_candidate_rule(CANDIDATE_RULE_AUTO)
+        self.hall_pool = HallOfFamePool(
+            self.artist_manager.artists,
+            self.hall_elo_system,
+            self.artist_manager.active_pool,
+        )
         self.history = ComparisonHistory(COMPARISON_HISTORY_FILE)
         self.preset_store = PromptPresetStore(PROMPT_PRESETS_FILE)
         self.session: Optional[ApiCredential] = None
@@ -2348,6 +2986,18 @@ class ArtistELORanker:
         self.current_uc_preset: int = self.current_generation_settings.uc_preset
         self.current_pair_seed: Optional[int] = None
         self.current_pool_action: str = POOL_ACTION_STANDARD
+        self.current_pool_context: str = POOL_CONTEXT_MAIN
+        self.current_comparison_mode: str = COMPARISON_MODE_NORMAL
+        self.current_weights_a: List[float] = []
+        self.current_weights_b: List[float] = []
+        self.current_side_actions: Dict[str, Optional[str]] = {
+            "A": None,
+            "B": None,
+        }
+
+        # The weighted HOF page keeps its own pair so switching tabs cannot
+        # accidentally vote on the other page's images.
+        self.weighted_state = WeightedComparisonState()
 
         # Undo state
         self.last_undo_state: Optional[UndoState] = None
@@ -2360,6 +3010,7 @@ class ArtistELORanker:
         # Reuse the last unexpired pair after a mobile page refresh or server
         # restart. This avoids an accidental extra NovelAI generation charge.
         self.load_current_comparison()
+        self.load_weighted_comparison()
 
     @staticmethod
     def _load_image_path(value: str) -> Optional[Path]:
@@ -2417,6 +3068,29 @@ class ArtistELORanker:
             self.current_pool_action = str(
                 data.get("pool_action", POOL_ACTION_STANDARD)
             )
+            self.current_pool_context = str(
+                data.get("pool_context", POOL_CONTEXT_MAIN)
+            )
+            if self.current_pool_context not in {
+                POOL_CONTEXT_MAIN,
+                POOL_CONTEXT_HALL,
+            }:
+                self.current_pool_context = POOL_CONTEXT_MAIN
+            self.current_comparison_mode = str(
+                data.get("comparison_mode", COMPARISON_MODE_NORMAL)
+            )
+            self.current_weights_a = [
+                float(weight) for weight in data.get("weights_a", [])
+            ]
+            self.current_weights_b = [
+                float(weight) for weight in data.get("weights_b", [])
+            ]
+            raw_side_actions = data.get("side_actions", {})
+            if isinstance(raw_side_actions, dict):
+                self.current_side_actions = {
+                    "A": raw_side_actions.get("A"),
+                    "B": raw_side_actions.get("B"),
+                }
             self.selection_made = bool(data.get("selection_made", False))
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             print(f"Could not restore current comparison: {exc}")
@@ -2439,6 +3113,11 @@ class ArtistELORanker:
             "generation_settings": self.current_generation_settings.to_dict(),
             "pair_seed": self.current_pair_seed,
             "pool_action": self.current_pool_action,
+            "pool_context": self.current_pool_context,
+            "comparison_mode": self.current_comparison_mode,
+            "weights_a": self.current_weights_a,
+            "weights_b": self.current_weights_b,
+            "side_actions": self.current_side_actions,
             "selection_made": self.selection_made,
         }
         temp_file = CURRENT_COMPARISON_FILE.with_suffix(".tmp")
@@ -2448,6 +3127,69 @@ class ArtistELORanker:
             temp_file.replace(CURRENT_COMPARISON_FILE)
         except OSError as exc:
             print(f"Could not save current comparison: {exc}")
+
+    def load_weighted_comparison(self):
+        """Restore the independent weighted HOF pair after mobile refresh."""
+        if not WEIGHTED_COMPARISON_FILE.exists():
+            return
+        try:
+            with open(WEIGHTED_COMPARISON_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            image_a = self._load_image_path(data.get("image_a", ""))
+            image_b = self._load_image_path(data.get("image_b", ""))
+            artists_a = [str(value) for value in data.get("artists_a", [])]
+            artists_b = [str(value) for value in data.get("artists_b", [])]
+            weights_a = [float(value) for value in data.get("weights_a", [])]
+            weights_b = [float(value) for value in data.get("weights_b", [])]
+            if not image_a or not image_b or not artists_a or not artists_b:
+                return
+            if len(artists_a) != len(weights_a) or len(artists_b) != len(weights_b):
+                return
+            self.weighted_state.image_a = image_a
+            self.weighted_state.image_b = image_b
+            self.weighted_state.artists_a = artists_a
+            self.weighted_state.artists_b = artists_b
+            self.weighted_state.weights_a = weights_a
+            self.weighted_state.weights_b = weights_b
+            self.weighted_state.generation_settings = GenerationSettings.from_dict(
+                data.get("generation_settings", {})
+            )
+            pair_seed = data.get("pair_seed")
+            self.weighted_state.pair_seed = (
+                int(pair_seed) if pair_seed is not None else None
+            )
+            self.weighted_state.selection_made = bool(
+                data.get("selection_made", False)
+            )
+            raw_actions = data.get("side_actions", {})
+            if isinstance(raw_actions, dict):
+                self.weighted_state.side_actions = {
+                    "A": raw_actions.get("A"),
+                    "B": raw_actions.get("B"),
+                }
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            print(f"Could not restore weighted comparison: {exc}")
+
+    def save_weighted_comparison(self):
+        state = self.weighted_state
+        if not state.image_a or not state.image_b:
+            return
+        data = {
+            "image_a": str(state.image_a),
+            "image_b": str(state.image_b),
+            "artists_a": state.artists_a,
+            "artists_b": state.artists_b,
+            "weights_a": state.weights_a,
+            "weights_b": state.weights_b,
+            "generation_settings": state.generation_settings.to_dict(),
+            "pair_seed": state.pair_seed,
+            "selection_made": state.selection_made,
+            "side_actions": state.side_actions,
+        }
+        temp_file = WEIGHTED_COMPARISON_FILE.with_suffix(".tmp")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        temp_file.replace(WEIGHTED_COMPARISON_FILE)
 
     def get_session(self) -> ApiCredential:
         """Get or create API session."""
@@ -2469,29 +3211,27 @@ class ArtistELORanker:
         balance = "—" if self.anlas_balance is None else f"{self.anlas_balance:,}"
         return f"◆ **{balance} Anlas**"
 
-    def format_pool_badge(self) -> str:
+    def format_pool_badge(
+        self,
+        pool_context: str = POOL_CONTEXT_MAIN,
+    ) -> str:
         stats = self.artist_manager.get_pool_stats()
-        mode = get_ranking_mode_label(self.artist_manager.get_ranking_mode())
-        candidate_rule = get_candidate_rule_label(
-            self.artist_manager.get_candidate_rule()
-        )
+        hall_stats = self.hall_pool.get_stats()
         temporary = self.artist_manager.get_temporary_pool_stats()
-        if temporary["enabled"]:
-            return (
-                f"**임시 풀 {temporary['size']}명 탐색 중** · "
-                f"활성 풀 {stats.get('size', 0)}명 보존 · "
-                f"풀 아웃 {stats.get('out_count', 0)}명 · "
-                f"**{candidate_rule}**"
-            )
+        selected = (
+            "명예의 전당"
+            if pool_context == POOL_CONTEXT_HALL
+            else "전체 작가 풀"
+        )
         return (
-            f"**활성 풀 {stats.get('size', 0)}명** · "
+            f"**{selected}** · 전체 풀 {stats.get('size', 0)}명 · "
+            f"명예의 전당 {hall_stats['size']}명 · "
             f"풀 아웃 {stats.get('out_count', 0)}명 · "
-            f"전체 {stats.get('total_artists', 0)}명 · "
-            f"**{mode} / {candidate_rule}**"
+            f"임시 대기 {temporary['size']}명"
         )
 
     def format_temporary_pool_status(self) -> str:
-        """Explain whether future comparisons use the isolated temporary pool."""
+        """Explain the temporary-to-main intake flow."""
         stats = self.artist_manager.get_temporary_pool_stats()
         if stats["enabled"]:
             return (
@@ -2499,8 +3239,8 @@ class ArtistELORanker:
                 f"활성 풀에 이미 있는 작가 {stats['already_active']}명 · "
                 f"활성 풀 밖 작가 {stats['outside_active']}명 · "
                 f"평가 이력 보유 {stats['rated']}명  \n"
-                "다음 비교부터 한 명 대 한 명으로 평가합니다. "
-                "ELO와 기록은 저장되지만 활성 풀은 변경되지 않습니다."
+                "다음 전체 풀 비교부터 양쪽 조합에 임시 작가가 반드시 포함됩니다. "
+                "투표가 끝나면 사용된 임시 작가는 전체 풀에 자동 편입됩니다."
             )
         if stats["size"]:
             return (
@@ -2542,42 +3282,70 @@ class ArtistELORanker:
         )
 
     def export_leaderboard_csv(self) -> str:
-        """Export full leaderboard sorted by ELO as CSV with detailed stats."""
-        sorted_artists = sorted(
-            self.elo_system.ratings.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )
+        """Export main and HOF ratings plus mode and weight statistics."""
         artist_stats = self.history.get_artist_stats()
+        all_rated = set(self.elo_system.ratings) | set(self.hall_elo_system.ratings)
+        sorted_artists = sorted(
+            all_rated,
+            key=lambda artist: self.elo_system.get_rating(artist),
+            reverse=True,
+        )
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "Main_Rank", "Artist", "Pool_Status", "Main_ELO",
+            "Main_Comparisons", "HOF_ELO", "HOF_Comparisons",
+            "Rounds", "Wins", "Losses", "WinRate", "Solo_Rounds",
+            "Normal_Rounds", "Weighted_Rounds", "Average_Weight",
+        ])
 
-        lines = ["Rank,Artist,Label,Pool_Status,ELO,Comparisons,Wins,Losses,WinRate,Solo_Rounds,Solo_Wins,Solo_WR,Duo_Rounds,Duo_Wins,Duo_WR,Trio_Rounds,Trio_Wins,Trio_WR"]
-
-        for rank, (artist, rating) in enumerate(sorted_artists, 1):
-            comparisons = self.elo_system.get_artist_comparison_count(artist)
+        main_rank = {
+            artist: rank
+            for rank, artist in enumerate(sorted_artists, 1)
+        }
+        hall_members = set(self.hall_pool.artists)
+        main_members = set(self.artist_manager.active_pool.pool)
+        for artist in sorted_artists:
             stats = artist_stats.get(artist, {})
-
-            rounds = stats.get('rounds', 0)
-            wins = stats.get('wins', 0)
+            rounds = stats.get("rounds", 0)
+            wins = stats.get("wins", 0)
             losses = rounds - wins
             win_rate = (wins / rounds * 100) if rounds > 0 else 0
-
-            solo = stats.get('solo', {'rounds': 0, 'wins': 0})
-            duo = stats.get('duo', {'rounds': 0, 'wins': 0})
-            trio = stats.get('trio', {'rounds': 0, 'wins': 0})
-
-            solo_wr = (solo['wins'] / solo['rounds'] * 100) if solo['rounds'] > 0 else 0
-            duo_wr = (duo['wins'] / duo['rounds'] * 100) if duo['rounds'] > 0 else 0
-            trio_wr = (trio['wins'] / trio['rounds'] * 100) if trio['rounds'] > 0 else 0
-            label = self.artist_manager.get_artist_candidate_label(artist)
+            modes = stats.get("modes", {})
+            weighted = stats.get("weighted", {})
+            weighted_rounds = weighted.get("rounds", 0)
+            average_weight = (
+                weighted.get("total_weight", 0.0) / weighted_rounds
+                if weighted_rounds
+                else 0.0
+            )
             pool_status = (
-                "active"
-                if artist in self.artist_manager.active_pool.pool
+                "hall_of_fame" if artist in hall_members
+                else "main" if artist in main_members
                 else "out"
             )
-
-            lines.append(f"{rank},{artist},{label},{pool_status},{rating:.0f},{comparisons},{wins},{losses},{win_rate:.1f},{solo['rounds']},{solo['wins']},{solo_wr:.1f},{duo['rounds']},{duo['wins']},{duo_wr:.1f},{trio['rounds']},{trio['wins']},{trio_wr:.1f}")
-
-        return "\n".join(lines)
+            writer.writerow([
+                main_rank[artist],
+                artist,
+                pool_status,
+                f"{self.elo_system.get_rating(artist):.2f}",
+                self.elo_system.get_artist_comparison_count(artist),
+                (
+                    f"{self.hall_elo_system.get_rating(artist):.2f}"
+                    if artist in self.hall_elo_system.ratings
+                    else ""
+                ),
+                self.hall_elo_system.get_artist_comparison_count(artist),
+                rounds,
+                wins,
+                losses,
+                f"{win_rate:.1f}",
+                modes.get(COMPARISON_MODE_SOLO, {}).get("rounds", 0),
+                modes.get(COMPARISON_MODE_NORMAL, {}).get("rounds", 0),
+                weighted_rounds,
+                f"{average_weight:.2f}",
+            ])
+        return output.getvalue()
 
     def format_recent_history(self, limit: int = 10) -> str:
         """Format recent comparison history for display."""
@@ -2597,124 +3365,72 @@ class ArtistELORanker:
 
             winner_str = ", ".join(winner_artists)
             loser_str = ", ".join(loser_artists)
-
-            lines.append(f"{i}. **{winner_str}** 승 · {loser_str} 패")
+            context = record.get("pool_context", POOL_CONTEXT_MAIN)
+            mode = record.get("comparison_mode", COMPARISON_MODE_NORMAL)
+            context_label = "명예" if context == POOL_CONTEXT_HALL else "전체"
+            mode_label = {
+                COMPARISON_MODE_SOLO: "단일",
+                COMPARISON_MODE_WEIGHTED: "가중치",
+            }.get(mode, "일반")
+            lines.append(
+                f"{i}. `{context_label}·{mode_label}` **{winner_str}** 승 · {loser_str} 패"
+            )
 
         return "\n".join(lines)
 
-    def format_top_artists_display(self) -> str:
-        """Format top artists for display with win rate stats."""
-        top_artists = self.elo_system.get_top_artists(30)
-        pool_stats = self.artist_manager.get_pool_stats()
-        artist_stats = self.history.get_artist_stats()
-
-        lines = ["## 작가 랭킹", ""]
-
-        if not top_artists:
-            lines.append("아직 랭킹이 없습니다. 첫 비교를 시작하세요.")
+    def format_top_artists_display(
+        self,
+        pool_context: str = POOL_CONTEXT_MAIN,
+    ) -> str:
+        """Format the selected pool's own ELO leaderboard."""
+        is_hall = pool_context == POOL_CONTEXT_HALL
+        elo_system = (
+            getattr(self, "hall_elo_system", ELOSystem())
+            if is_hall
+            else self.elo_system
+        )
+        hall_pool = getattr(self, "hall_pool", None)
+        if is_hall:
+            members = hall_pool.artists if hall_pool else []
         else:
-            # Use markdown list format with win rate stats
-            for i, (artist, rating, comparisons) in enumerate(top_artists, 1):
-                stats = artist_stats.get(artist, {})
-                rounds = stats.get('rounds', 0)
-                wins = stats.get('wins', 0)
-                wr = (wins / rounds * 100) if rounds > 0 else 0
-                candidate_label = self.artist_manager.get_artist_candidate_label(
-                    artist
-                )
-                pool_suffix = (
-                    " · 풀 아웃"
-                    if artist not in self.artist_manager.active_pool.pool
-                    else ""
-                )
-
-                # Build compact W/R breakdown
-                solo = stats.get('solo', {})
-                duo = stats.get('duo', {})
-                trio = stats.get('trio', {})
-
-                # Format: S:80%(5) D:70%(10) - show W/R and count for each
-                wr_parts = []
-                if solo.get('rounds', 0) > 0:
-                    solo_wr = solo['wins'] / solo['rounds'] * 100
-                    wr_parts.append(f"S:{solo_wr:.0f}%({solo['rounds']})")
-                if duo.get('rounds', 0) > 0:
-                    duo_wr = duo['wins'] / duo['rounds'] * 100
-                    wr_parts.append(f"D:{duo_wr:.0f}%({duo['rounds']})")
-                if trio.get('rounds', 0) > 0:
-                    trio_wr = trio['wins'] / trio['rounds'] * 100
-                    wr_parts.append(f"T:{trio_wr:.0f}%({trio['rounds']})")
-
-                wr_breakdown = f" {' '.join(wr_parts)}" if wr_parts else ""
-
-                lines.append(
-                    f"{i}. **{artist}** `{candidate_label}`{pool_suffix} "
-                    f"{rating:.0f} — {wr:.0f}% ({rounds})"
-                )
-                if wr_breakdown.strip():
-                    lines.append(f"   {wr_breakdown.strip()}")
-
-        lines.append("")
-        lines.append("---")
-        lines.append("")
-        lines.append(f"**전체 비교:** {self.elo_system.comparison_count}  ")
-        lines.append(f"**평가한 작가:** {len(self.elo_system.ratings)}  ")
-        lines.append(f"**활성 풀:** {pool_stats.get('size', 0)}/{pool_stats.get('total_artists', 0)}  ")
-        lines.append(f"**풀 아웃:** {pool_stats.get('out_count', 0)}  ")
-        lines.append(
-            f"**평가 방향:** {get_ranking_mode_label(self.artist_manager.get_ranking_mode())}"
-        )
-        lines.append(
-            f"**후보 규칙:** {get_candidate_rule_label(self.artist_manager.get_candidate_rule())}"
-        )
-        temporary = self.artist_manager.get_temporary_pool_stats()
-        if temporary["enabled"]:
+            members = self.artist_manager.active_pool.pool
+        ranked = sorted(
+            members,
+            key=lambda artist: elo_system.get_rating(artist),
+            reverse=True,
+        )[:30]
+        title = "명예의 전당 랭킹" if is_hall else "전체 작가 풀 랭킹"
+        lines = [f"## {title}", ""]
+        if not ranked:
             lines.append(
-                f"**임시 풀:** {temporary['size']}명 단독 탐색 중 · 활성 풀 변경 없음"
+                "명예의 전당에 작가를 먼저 추가하세요."
+                if is_hall
+                else "아직 랭킹에 표시할 작가가 없습니다."
+            )
+        for rank, artist in enumerate(ranked, 1):
+            rating = elo_system.get_rating(artist)
+            comparisons = elo_system.get_artist_comparison_count(artist)
+            lines.append(
+                f"{rank}. **{artist}** {rating:.0f} · {comparisons}회"
             )
 
-        # Pool health breakdown
-        lines.append("")
-        lines.append("---")
-        lines.append("### 활성 풀 상태")
-        safe = pool_stats.get('safe', 0)
-        newcomers = pool_stats.get('newcomers', 0)
-        at_risk_count = pool_stats.get('at_risk_count', 0)
-        lines.append(f"평균 이상: {safe}  ")
-        lines.append(f"신규 (<5회): {newcomers}  ")
-        lines.append(f"평균 미만: {at_risk_count}")
-
-        # Show top at-risk artists
-        at_risk = pool_stats.get('at_risk', [])
-        lowest_elo = pool_stats.get('lowest_elo', [])
-        if (
-            self.artist_manager.get_ranking_mode()
-            == RANKING_MODE_FAST_ROTATION
-            and lowest_elo
-        ):
-            lines.append("")
-            lines.append("**ELO 최하위 작가:**")
-            for artist, elo, matches in lowest_elo[:5]:
-                lines.append(f"- {artist} ({elo:.0f}, {matches}회)")
-        elif at_risk:
-            lines.append("")
-            lines.append("**교체 가능성이 높은 작가:**")
-            for artist, elo, matches, weight in at_risk[:5]:
-                lines.append(f"- {artist} ({elo:.0f})")
-
-        # Show recent pool changes
-        if self.rotation_log:
-            lines.append("")
-            lines.append("---")
-            lines.append("### 최근 풀 변경")
-            lines.append("*최신순:*")
-            for rot_type, artist, elo, extra in self.rotation_log[:8]:
-                if rot_type == "in":
-                    status = "[returning]" if extra else "[new]"
-                    lines.append(f"+ **{artist}** ({elo:.0f}) {status}")
-                else:
-                    lines.append(f"- ~~{artist}~~ ({elo:.0f})")
-
+        pool_stats = self.artist_manager.get_pool_stats()
+        hall_stats = (
+            hall_pool.get_stats()
+            if hall_pool
+            else {"size": 0, "avg_elo": DEFAULT_ELO, "comparisons": 0}
+        )
+        lines.extend(["", "---", ""])
+        lines.append(f"**현재 풀:** {len(members)}명  ")
+        lines.append(f"**비교:** {elo_system.comparison_count}회  ")
+        lines.append(f"**전체 풀:** {pool_stats.get('size', 0)}명  ")
+        lines.append(f"**명예의 전당:** {hall_stats['size']}명  ")
+        lines.append(f"**풀 아웃:** {pool_stats.get('out_count', 0)}명")
+        temporary = self.artist_manager.get_temporary_pool_stats()
+        if temporary["enabled"] and not is_hall:
+            lines.append(
+                f"  \n**임시 작가:** {temporary['size']}명 투입 중"
+            )
         return "\n".join(lines)
 
     async def generate_new_comparison(
@@ -2733,12 +3449,22 @@ class ArtistELORanker:
         sampler_key: str = NAI_SAMPLER,
         guidance_rescale: float = PROMPT_GUIDANCE_RESCALE,
         noise_schedule_key: str = NAI_NOISE_SCHEDULE,
+        pool_context: str = POOL_CONTEXT_MAIN,
+        hall_mode: str = COMPARISON_MODE_NORMAL,
     ):
         """Generate a new pair of images for comparison."""
         custom_prompt = custom_prompt or ""
         custom_negative_prompt = custom_negative_prompt or ""
-        self.artist_manager.set_ranking_mode(ranking_mode)
-        self.artist_manager.set_candidate_rule(candidate_rule)
+        pool_context = (
+            pool_context
+            if pool_context in {POOL_CONTEXT_MAIN, POOL_CONTEXT_HALL}
+            else POOL_CONTEXT_MAIN
+        )
+        hall_mode = (
+            hall_mode
+            if hall_mode in {COMPARISON_MODE_NORMAL, COMPARISON_MODE_SOLO}
+            else COMPARISON_MODE_NORMAL
+        )
 
         try:
             settings = GenerationSettings.from_values(
@@ -2758,9 +3484,9 @@ class ArtistELORanker:
                 None,
                 None,
                 f"**설정 오류:** {exc}",
-                self.format_pool_badge(),
+                self.format_pool_badge(pool_context),
                 self.format_anlas_display(),
-                self.format_top_artists_display(),
+                self.format_top_artists_display(pool_context),
                 "",
                 "",
                 gr.update(interactive=False),
@@ -2792,7 +3518,7 @@ class ArtistELORanker:
 
         try:
             session = self.get_session()
-        except ValueError as e:
+        except ValueError:
             # API key not configured
             error_msg = (
                 "**NovelAI API 키가 설정되지 않았습니다.**\n\n"
@@ -2803,9 +3529,9 @@ class ArtistELORanker:
                 None,
                 None,
                 error_msg,
-                self.format_pool_badge(),
+                self.format_pool_badge(pool_context),
                 self.format_anlas_display(),
-                self.format_top_artists_display(),
+                self.format_top_artists_display(pool_context),
                 "",
                 "",
                 gr.update(interactive=False),
@@ -2813,15 +3539,52 @@ class ArtistELORanker:
                 gr.update(interactive=False),
             )
 
-        path_a, path_b, artists_a, artists_b, pool_action = await generate_comparison_pair(
-            base_prompt,
-            self.artist_manager,
-            session,
-            COMPARISON_IMAGES_DIR,
-            settings,
-            self.current_pair_seed,
-            negative_prompt,
-        )
+        try:
+            if pool_context == POOL_CONTEXT_HALL:
+                artists_a, artists_b = self.hall_pool.select_pair(hall_mode)
+                path_a, path_b = await generate_selected_comparison_pair(
+                    base_prompt,
+                    self.artist_manager,
+                    session,
+                    COMPARISON_IMAGES_DIR,
+                    settings,
+                    self.current_pair_seed,
+                    artists_a,
+                    artists_b,
+                    negative_prompt,
+                    filename_prefix="hall",
+                )
+                pool_action = POOL_ACTION_STANDARD
+            else:
+                (
+                    path_a,
+                    path_b,
+                    artists_a,
+                    artists_b,
+                    pool_action,
+                ) = await generate_comparison_pair(
+                    base_prompt,
+                    self.artist_manager,
+                    session,
+                    COMPARISON_IMAGES_DIR,
+                    settings,
+                    self.current_pair_seed,
+                    negative_prompt,
+                )
+        except ValueError as exc:
+            return (
+                None,
+                None,
+                f"**비교를 만들 수 없습니다:** {exc}",
+                self.format_pool_badge(pool_context),
+                self.format_anlas_display(),
+                self.format_top_artists_display(pool_context),
+                "",
+                "",
+                gr.update(interactive=False),
+                gr.update(interactive=False),
+                gr.update(interactive=self.last_undo_state is not None),
+            )
 
         await self.refresh_anlas_balance()
 
@@ -2831,6 +3594,15 @@ class ArtistELORanker:
             self.current_artists_a = artists_a
             self.current_artists_b = artists_b
             self.current_pool_action = pool_action
+            self.current_pool_context = pool_context
+            self.current_comparison_mode = (
+                hall_mode
+                if pool_context == POOL_CONTEXT_HALL
+                else COMPARISON_MODE_NORMAL
+            )
+            self.current_weights_a = []
+            self.current_weights_b = []
+            self.current_side_actions = {"A": None, "B": None}
 
             # Reset selection state for new comparison
             # BUT keep undo state so user can still undo the previous selection!
@@ -2844,10 +3616,17 @@ class ArtistELORanker:
             return (
                 str(path_a),
                 str(path_b),
-                get_pool_action_status(pool_action),
-                self.format_pool_badge(),
+                (
+                    "명예의 전당 단일 작가 비교입니다."
+                    if pool_context == POOL_CONTEXT_HALL
+                    and hall_mode == COMPARISON_MODE_SOLO
+                    else "명예의 전당 일반 조합 비교입니다."
+                    if pool_context == POOL_CONTEXT_HALL
+                    else get_pool_action_status(pool_action)
+                ),
+                self.format_pool_badge(pool_context),
                 self.format_anlas_display(),
-                self.format_top_artists_display(),
+                self.format_top_artists_display(pool_context),
                 "",  # Clear result_msg
                 "",  # Clear details_msg
                 gr.update(interactive=True),   # Enable pick_a
@@ -2859,9 +3638,9 @@ class ArtistELORanker:
                 None,
                 None,
                 "이미지 생성에 실패했습니다. 잠시 후 건너뛰기를 눌러 다시 시도하세요.",
-                self.format_pool_badge(),
+                self.format_pool_badge(pool_context),
                 self.format_anlas_display(),
-                self.format_top_artists_display(),
+                self.format_top_artists_display(pool_context),
                 "",
                 "",
                 gr.update(interactive=False),
@@ -2871,11 +3650,31 @@ class ArtistELORanker:
 
     def pick_winner(self, winner: str):
         """Process a winner selection. Returns tuple for UI update."""
+        pool_context = getattr(
+            self,
+            "current_pool_context",
+            POOL_CONTEXT_MAIN,
+        )
+        comparison_mode = getattr(
+            self,
+            "current_comparison_mode",
+            COMPARISON_MODE_NORMAL,
+        )
+        rating_system = (
+            self.hall_elo_system
+            if pool_context == POOL_CONTEXT_HALL
+            else self.elo_system
+        )
+        rating_file = (
+            HALL_OF_FAME_ELO_FILE
+            if pool_context == POOL_CONTEXT_HALL
+            else ELO_RATINGS_FILE
+        )
         if not self.current_artists_a or not self.current_artists_b:
             return (
                 "진행 중인 비교가 없습니다. 먼저 이미지를 생성하세요.",
                 "",
-                self.format_top_artists_display(),
+                self.format_top_artists_display(pool_context),
                 gr.update(interactive=True),  # pick_a
                 gr.update(interactive=True),  # pick_b
                 gr.update(interactive=False),  # undo
@@ -2885,7 +3684,7 @@ class ArtistELORanker:
             return (
                 "이미 선택한 비교입니다. 되돌리거나 다음 이미지를 생성하세요.",
                 "",
-                self.format_top_artists_display(),
+                self.format_top_artists_display(pool_context),
                 gr.update(interactive=False),
                 gr.update(interactive=False),
                 gr.update(interactive=True),
@@ -2899,26 +3698,55 @@ class ArtistELORanker:
             losers = self.current_artists_a
 
         # Save state for undo BEFORE making changes
-        old_ratings = {a: self.elo_system.get_rating(a) for a in winners + losers}
-        old_comparisons = {a: self.elo_system.get_artist_comparison_count(a) for a in winners + losers}
+        compared_artists = list(dict.fromkeys(winners + losers))
+        old_ratings = {
+            artist: rating_system.get_rating(artist)
+            for artist in compared_artists
+        }
+        old_comparisons = {
+            artist: rating_system.get_artist_comparison_count(artist)
+            for artist in compared_artists
+        }
         old_rating_presence = {
-            a: a in self.elo_system.ratings for a in winners + losers
+            artist: artist in rating_system.ratings
+            for artist in compared_artists
         }
         old_comparison_presence = {
-            a: a in self.elo_system.artist_comparisons
-            for a in winners + losers
+            artist: artist in rating_system.artist_comparisons
+            for artist in compared_artists
         }
+        old_mode_comparisons = {
+            artist: dict(rating_system.mode_comparisons.get(artist, {}))
+            for artist in compared_artists
+        }
+        old_weighted_exposure = {
+            artist: float(rating_system.weighted_exposure.get(artist, 0.0))
+            for artist in compared_artists
+        }
+        old_mode_presence = {
+            artist: artist in rating_system.mode_comparisons
+            for artist in compared_artists
+        }
+        old_exposure_presence = {
+            artist: artist in rating_system.weighted_exposure
+            for artist in compared_artists
+        }
+        temporary_pool_before = self.artist_manager.temporary_pool.copy()
+        temporary_enabled_before = self.artist_manager.temporary_pool_enabled
 
         # Update ELO ratings
-        self.elo_system.update_ratings(winners, losers)
-        self.elo_system.save(ELO_RATINGS_FILE)
+        rating_system.update_ratings(winners, losers, comparison_mode)
+        rating_system.save(rating_file)
 
         # Update active pool (rotate losers, introduce new artists)
-        rotated_out, rotated_in = self.artist_manager.process_result(
-            winners,
-            losers,
-            self.current_pool_action,
-        )
+        if pool_context == POOL_CONTEXT_MAIN:
+            rotated_out, rotated_in = self.artist_manager.process_result(
+                winners,
+                losers,
+                self.current_pool_action,
+            )
+        else:
+            rotated_out, rotated_in = [], []
 
         # Log rotations (most recent first)
         for artist, elo, is_returning in rotated_in:
@@ -2932,6 +3760,7 @@ class ArtistELORanker:
         # Extract just artist names for undo
         rotated_out_names = [artist for artist, elo in rotated_out]
         rotated_in_names = [artist for artist, elo, is_returning in rotated_in]
+        history_timestamp = time.time()
         self.last_undo_state = UndoState(
             winners=winners.copy(),
             losers=losers.copy(),
@@ -2948,13 +3777,26 @@ class ArtistELORanker:
             prev_pool_action=self.current_pool_action,
             prev_generation_settings=self.current_generation_settings.to_dict(),
             prev_pair_seed=self.current_pair_seed,
+            elo_context=pool_context,
+            old_total_comparisons=rating_system.comparison_count - 1,
+            old_mode_comparisons=old_mode_comparisons,
+            old_weighted_exposure=old_weighted_exposure,
+            old_mode_presence=old_mode_presence,
+            old_exposure_presence=old_exposure_presence,
+            temporary_pool_before=temporary_pool_before,
+            temporary_enabled_before=temporary_enabled_before,
+            history_timestamp=history_timestamp,
+            prev_pool_context=pool_context,
+            prev_comparison_mode=comparison_mode,
+            prev_weights_a=getattr(self, "current_weights_a", []).copy(),
+            prev_weights_b=getattr(self, "current_weights_b", []).copy(),
         )
         self.selection_made = True
         self.save_current_comparison()
 
         # Record history
         record = ComparisonRecord(
-            timestamp=time.time(),
+            timestamp=history_timestamp,
             artists_a=self.current_artists_a,
             artists_b=self.current_artists_b,
             winner=winner,
@@ -2962,6 +3804,10 @@ class ArtistELORanker:
             image_b_path=str(self.current_image_b) if self.current_image_b else "",
             generation_settings=self.current_generation_settings.to_dict(),
             pair_seed=self.current_pair_seed,
+            pool_context=pool_context,
+            comparison_mode=comparison_mode,
+            weights_a=getattr(self, "current_weights_a", []).copy(),
+            weights_b=getattr(self, "current_weights_b", []).copy(),
         )
         self.history.add_record(record)
 
@@ -2976,13 +3822,13 @@ class ArtistELORanker:
         details += f"**이미지 B:** {', '.join(self.current_artists_b)}\n\n"
         details += "**변경된 ELO:**\n"
         for artist in winners + losers:
-            rating = self.elo_system.get_rating(artist)
+            rating = rating_system.get_rating(artist)
             details += f"- {artist}: {rating:.0f}\n"
 
         return (
             result_msg,
             details,
-            self.format_top_artists_display(),
+            self.format_top_artists_display(pool_context),
             gr.update(interactive=False),  # Disable pick_a
             gr.update(interactive=False),  # Disable pick_b
             gr.update(interactive=True),   # Enable undo
@@ -3004,28 +3850,59 @@ class ArtistELORanker:
             )
 
         state = self.last_undo_state
+        rating_system = (
+            self.hall_elo_system
+            if state.elo_context == POOL_CONTEXT_HALL
+            else self.elo_system
+        )
+        rating_file = (
+            HALL_OF_FAME_ELO_FILE
+            if state.elo_context == POOL_CONTEXT_HALL
+            else ELO_RATINGS_FILE
+        )
 
         # Restore old ratings
         for artist, old_rating in state.old_ratings.items():
             if state.old_rating_presence.get(artist, True):
-                self.elo_system.ratings[artist] = old_rating
+                rating_system.ratings[artist] = old_rating
             else:
-                self.elo_system.ratings.pop(artist, None)
+                rating_system.ratings.pop(artist, None)
 
         # Restore old comparison counts
         for artist, old_count in state.old_comparisons.items():
             if state.old_comparison_presence.get(artist, True):
-                self.elo_system.artist_comparisons[artist] = old_count
+                rating_system.artist_comparisons[artist] = old_count
             else:
-                self.elo_system.artist_comparisons.pop(artist, None)
+                rating_system.artist_comparisons.pop(artist, None)
 
-        # Decrement total comparison count
-        self.elo_system.comparison_count -= 1
-        self.elo_system.save(ELO_RATINGS_FILE)
+        for artist, old_modes in state.old_mode_comparisons.items():
+            if state.old_mode_presence.get(artist, False):
+                rating_system.mode_comparisons[artist] = dict(old_modes)
+            else:
+                rating_system.mode_comparisons.pop(artist, None)
+        for artist, old_exposure in state.old_weighted_exposure.items():
+            if state.old_exposure_presence.get(artist, False):
+                rating_system.weighted_exposure[artist] = old_exposure
+            else:
+                rating_system.weighted_exposure.pop(artist, None)
+
+        rating_system.comparison_count = state.old_total_comparisons
+        rating_system.save(rating_file)
 
         # Restore all active-pool changes, including newly added artists.
-        if state.rotated_out or state.rotated_in:
+        if (
+            state.elo_context == POOL_CONTEXT_MAIN
+            and (state.rotated_out or state.rotated_in)
+        ):
             self.artist_manager.revert_rotation(state.rotated_out, state.rotated_in)
+        if state.elo_context == POOL_CONTEXT_MAIN:
+            self.artist_manager.temporary_pool = (
+                state.temporary_pool_before.copy()
+            )
+            self.artist_manager.temporary_pool_enabled = (
+                state.temporary_enabled_before
+            )
+            self.artist_manager.save_temporary_pool()
 
         # Remove the corresponding entries from the in-memory rotation log.
         for rotation_type, artists in (
@@ -3038,9 +3915,12 @@ class ArtistELORanker:
                         self.rotation_log.pop(index)
                         break
 
-        # Remove last history record
-        if self.history.records:
-            self.history.records.pop()
+        # Remove this page's exact record even if the other tab was used later.
+        if state.history_timestamp is not None:
+            self.history.records = [
+                record for record in self.history.records
+                if record.get("timestamp") != state.history_timestamp
+            ]
             self.history.save()
 
         # Restore previous images and artists
@@ -3057,6 +3937,10 @@ class ArtistELORanker:
         )
         self.current_uc_preset = self.current_generation_settings.uc_preset
         self.current_pair_seed = state.prev_pair_seed
+        self.current_pool_context = state.prev_pool_context
+        self.current_comparison_mode = state.prev_comparison_mode
+        self.current_weights_a = state.prev_weights_a.copy()
+        self.current_weights_b = state.prev_weights_b.copy()
 
         # Clear undo state and reset selection
         self.last_undo_state = None
@@ -3066,8 +3950,8 @@ class ArtistELORanker:
         return (
             state.prev_image_a,  # image_a
             state.prev_image_b,  # image_b
-            f"**선택을 되돌렸습니다.** {get_pool_action_status(self.current_pool_action)}",
-            self.format_top_artists_display(),
+            "**선택을 되돌렸습니다.** 이전 비교를 다시 선택할 수 있습니다.",
+            self.format_top_artists_display(state.elo_context),
             "",  # Clear result_msg
             "",  # Clear details_msg
             gr.update(interactive=True),   # Enable pick_a
@@ -3075,7 +3959,426 @@ class ArtistELORanker:
             gr.update(interactive=False),  # Disable undo
         )
 
-    def create_ui(self) -> gr.Blocks:
+    def _remove_temporary_entries(self, artists: List[str]):
+        removed = set(artists)
+        if not removed:
+            return
+        self.artist_manager.temporary_pool = [
+            artist for artist in self.artist_manager.temporary_pool
+            if artist not in removed
+        ]
+        if len(self.artist_manager.temporary_pool) < 2:
+            self.artist_manager.temporary_pool_enabled = False
+        self.artist_manager.save_temporary_pool()
+
+    def apply_star_action(
+        self,
+        side: str,
+        weighted: bool = False,
+    ) -> Tuple[str, bool]:
+        """Induct from main, or return HOF artists to their preserved main ELO."""
+        side = "A" if side == "A" else "B"
+        if weighted:
+            artists = (
+                self.weighted_state.artists_a
+                if side == "A"
+                else self.weighted_state.artists_b
+            )
+            if not artists:
+                return "진행 중인 가중치 비교가 없습니다.", False
+            returned = self.hall_pool.return_to_main(artists)
+            if not returned:
+                return "이미 전체 풀로 복귀한 조합입니다.", False
+            self.weighted_state.side_actions[side] = "returned"
+            self.weighted_state.selection_made = True
+            self.save_weighted_comparison()
+            return (
+                f"**{side} 조합 {len(returned)}명**을 전체 풀로 복귀시켰습니다. "
+                "보관된 전체 풀 ELO가 그대로 사용됩니다.",
+                True,
+            )
+
+        artists = (
+            self.current_artists_a
+            if side == "A"
+            else self.current_artists_b
+        )
+        if not artists:
+            return "진행 중인 비교가 없습니다.", False
+
+        in_hall = all(artist in self.hall_pool.artists for artist in artists)
+        if self.current_pool_context == POOL_CONTEXT_HALL or in_hall:
+            returned = self.hall_pool.return_to_main(artists)
+            if not returned:
+                return "이미 전체 풀로 복귀한 조합입니다.", False
+            self.current_side_actions[side] = (
+                None
+                if self.current_pool_context == POOL_CONTEXT_MAIN
+                else "returned"
+            )
+            if self.current_pool_context == POOL_CONTEXT_HALL:
+                self.selection_made = True
+            elif not any(self.current_side_actions.values()):
+                self.selection_made = False
+            self.save_current_comparison()
+            return (
+                f"**{side} 조합 {len(returned)}명**을 전체 풀로 복귀시켰습니다. "
+                "기존 전체 풀 ELO를 복구했습니다.",
+                True,
+            )
+
+        inducted = self.hall_pool.induct(artists)
+        if not inducted:
+            return "명예의 전당으로 이동할 작가가 없습니다.", False
+        self.hall_elo_system.save(HALL_OF_FAME_ELO_FILE)
+        self._remove_temporary_entries(inducted)
+        self.current_side_actions[side] = "hall"
+        self.selection_made = True
+        self.save_current_comparison()
+        return (
+            f"**{side} 조합 {len(inducted)}명**을 명예의 전당으로 옮겼습니다. "
+            "명예의 전당 ELO는 모두 1500점으로 초기화했습니다.",
+            True,
+        )
+
+    def apply_broken_heart(self, side: str) -> Tuple[str, bool]:
+        """Explicitly remove a main-pool combination from future sampling."""
+        side = "A" if side == "A" else "B"
+        if self.current_pool_context != POOL_CONTEXT_MAIN:
+            return "명예의 전당에서는 깨진 하트를 사용할 수 없습니다.", False
+        artists = (
+            self.current_artists_a
+            if side == "A"
+            else self.current_artists_b
+        )
+        if not artists:
+            return "진행 중인 비교가 없습니다.", False
+        self.artist_manager.active_pool.remove_artists(artists, permanent=True)
+        self._remove_temporary_entries(artists)
+        self.current_side_actions[side] = "removed"
+        self.selection_made = True
+        self.save_current_comparison()
+        return (
+            f"**{side} 조합 {len(set(artists))}명**을 전체 풀에서 제외했습니다.",
+            True,
+        )
+
+    def format_weighted_side(
+        self,
+        artists: List[str],
+        weights: List[float],
+    ) -> str:
+        if not artists:
+            return ""
+        combined = self.hall_elo_system.get_weighted_combined_rating(
+            artists,
+            weights,
+        )
+        tags = self.artist_manager.format_artist_tags(artists, weights)
+        lines = [f"**가중 조합 ELO {combined:.0f} · 총 가중치 {sum(weights):.1f}**", ""]
+        lines.extend(
+            f"- `{weight:.1f}` {artist} · {self.hall_elo_system.get_rating(artist):.0f}"
+            for artist, weight in zip(artists, weights)
+        )
+        lines.extend(["", f"```text\n{tags}\n```"])
+        return "\n".join(lines)
+
+    async def generate_weighted_comparison(
+        self,
+        custom_prompt: str,
+        custom_negative_prompt: str,
+        quality_toggle: bool,
+        uc_preset: int,
+        artists_per_side: int,
+        resolution_key: str,
+        steps: int,
+        guidance: float,
+        variety_boost: bool,
+        seed: Any,
+        sampler_key: str,
+        guidance_rescale: float,
+        noise_schedule_key: str,
+    ):
+        """Generate a 3-10 artist weighted HOF matchup for page two."""
+        try:
+            settings = GenerationSettings.from_values(
+                resolution_key,
+                steps,
+                guidance,
+                sampler_key,
+                seed,
+                variety_boost,
+                guidance_rescale,
+                noise_schedule_key,
+                quality_toggle,
+                uc_preset,
+            )
+            artists_a, artists_b, weights_a, weights_b = (
+                self.hall_pool.select_weighted_pair(int(artists_per_side))
+            )
+            session = self.get_session()
+        except ValueError as exc:
+            return (
+                None,
+                None,
+                f"**가중치 비교를 만들 수 없습니다:** {exc}",
+                self.format_pool_badge(POOL_CONTEXT_HALL),
+                self.format_anlas_display(),
+                self.format_top_artists_display(POOL_CONTEXT_HALL),
+                "",
+                "",
+                gr.update(interactive=False),
+                gr.update(interactive=False),
+                gr.update(interactive=self.weighted_state.undo_state is not None),
+            )
+
+        base_prompt = (
+            custom_prompt.strip()
+            if custom_prompt and custom_prompt.strip()
+            else DEFAULT_PROMPT
+        )
+        base_prompt = remove_artist_tags(base_prompt)
+        if "{artist_placeholder}" not in base_prompt:
+            base_prompt = insert_artist_tags(base_prompt, "{artist_placeholder}")
+        negative_prompt = (
+            custom_negative_prompt.strip()
+            if custom_negative_prompt and custom_negative_prompt.strip()
+            else None
+        )
+        pair_seed = settings.seed or random.randint(1, MAX_SEED)
+        path_a, path_b = await generate_selected_comparison_pair(
+            base_prompt,
+            self.artist_manager,
+            session,
+            COMPARISON_IMAGES_DIR,
+            settings,
+            pair_seed,
+            artists_a,
+            artists_b,
+            negative_prompt,
+            weights_a,
+            weights_b,
+            filename_prefix="weighted_hall",
+        )
+        await self.refresh_anlas_balance()
+        if not path_a or not path_b:
+            return (
+                None,
+                None,
+                "가중치 이미지 생성에 실패했습니다. 설정을 확인하고 다시 시도하세요.",
+                self.format_pool_badge(POOL_CONTEXT_HALL),
+                self.format_anlas_display(),
+                self.format_top_artists_display(POOL_CONTEXT_HALL),
+                "",
+                "",
+                gr.update(interactive=False),
+                gr.update(interactive=False),
+                gr.update(interactive=False),
+            )
+
+        self.weighted_state.image_a = path_a
+        self.weighted_state.image_b = path_b
+        self.weighted_state.artists_a = artists_a
+        self.weighted_state.artists_b = artists_b
+        self.weighted_state.weights_a = weights_a
+        self.weighted_state.weights_b = weights_b
+        self.weighted_state.generation_settings = settings
+        self.weighted_state.pair_seed = pair_seed
+        self.weighted_state.selection_made = False
+        self.weighted_state.side_actions = {"A": None, "B": None}
+        self.save_weighted_comparison()
+        return (
+            str(path_a),
+            str(path_b),
+            f"명예의 전당 {len(artists_a)}명 대 {len(artists_b)}명 가중치 비교입니다.",
+            self.format_pool_badge(POOL_CONTEXT_HALL),
+            self.format_anlas_display(),
+            self.format_top_artists_display(POOL_CONTEXT_HALL),
+            "",
+            "",
+            gr.update(interactive=True),
+            gr.update(interactive=True),
+            gr.update(interactive=self.weighted_state.undo_state is not None),
+        )
+
+    def pick_weighted_winner(self, winner: str):
+        state = self.weighted_state
+        if not state.artists_a or not state.artists_b:
+            return (
+                "진행 중인 가중치 비교가 없습니다.",
+                "",
+                self.format_top_artists_display(POOL_CONTEXT_HALL),
+                gr.update(interactive=False),
+                gr.update(interactive=False),
+                gr.update(interactive=False),
+            )
+        if state.selection_made:
+            return (
+                "이미 처리한 가중치 비교입니다.",
+                "",
+                self.format_top_artists_display(POOL_CONTEXT_HALL),
+                gr.update(interactive=False),
+                gr.update(interactive=False),
+                gr.update(interactive=state.undo_state is not None),
+            )
+
+        if winner == "A":
+            winners, losers = state.artists_a, state.artists_b
+            winner_weights, loser_weights = state.weights_a, state.weights_b
+        else:
+            winners, losers = state.artists_b, state.artists_a
+            winner_weights, loser_weights = state.weights_b, state.weights_a
+        compared = list(dict.fromkeys(winners + losers))
+        system = self.hall_elo_system
+        timestamp = time.time()
+        undo = UndoState(
+            winners=winners.copy(),
+            losers=losers.copy(),
+            old_ratings={artist: system.get_rating(artist) for artist in compared},
+            old_comparisons={
+                artist: system.get_artist_comparison_count(artist)
+                for artist in compared
+            },
+            old_rating_presence={artist: artist in system.ratings for artist in compared},
+            old_comparison_presence={
+                artist: artist in system.artist_comparisons for artist in compared
+            },
+            rotated_out=[],
+            rotated_in=[],
+            prev_image_a=str(state.image_a) if state.image_a else None,
+            prev_image_b=str(state.image_b) if state.image_b else None,
+            prev_artists_a=state.artists_a.copy(),
+            prev_artists_b=state.artists_b.copy(),
+            prev_generation_settings=state.generation_settings.to_dict(),
+            prev_pair_seed=state.pair_seed,
+            elo_context=POOL_CONTEXT_HALL,
+            old_total_comparisons=system.comparison_count,
+            old_mode_comparisons={
+                artist: dict(system.mode_comparisons.get(artist, {}))
+                for artist in compared
+            },
+            old_weighted_exposure={
+                artist: float(system.weighted_exposure.get(artist, 0.0))
+                for artist in compared
+            },
+            old_mode_presence={
+                artist: artist in system.mode_comparisons for artist in compared
+            },
+            old_exposure_presence={
+                artist: artist in system.weighted_exposure for artist in compared
+            },
+            history_timestamp=timestamp,
+            prev_pool_context=POOL_CONTEXT_HALL,
+            prev_comparison_mode=COMPARISON_MODE_WEIGHTED,
+            prev_weights_a=state.weights_a.copy(),
+            prev_weights_b=state.weights_b.copy(),
+        )
+        system.update_weighted_ratings(
+            winners,
+            losers,
+            winner_weights,
+            loser_weights,
+        )
+        system.save(HALL_OF_FAME_ELO_FILE)
+        state.undo_state = undo
+        state.selection_made = True
+        self.save_weighted_comparison()
+        self.history.add_record(ComparisonRecord(
+            timestamp=timestamp,
+            artists_a=state.artists_a,
+            artists_b=state.artists_b,
+            winner=winner,
+            image_a_path=str(state.image_a) if state.image_a else "",
+            image_b_path=str(state.image_b) if state.image_b else "",
+            generation_settings=state.generation_settings.to_dict(),
+            pair_seed=state.pair_seed,
+            pool_context=POOL_CONTEXT_HALL,
+            comparison_mode=COMPARISON_MODE_WEIGHTED,
+            weights_a=state.weights_a,
+            weights_b=state.weights_b,
+        ))
+        details = "### 변경된 명예의 전당 ELO\n" + "\n".join(
+            f"- {artist}: {system.get_rating(artist):.0f}"
+            for artist in winners + losers
+        )
+        return (
+            f"**{winner} 조합 승리** · 가중치에 따라 ELO를 반영했습니다.",
+            details,
+            self.format_top_artists_display(POOL_CONTEXT_HALL),
+            gr.update(interactive=False),
+            gr.update(interactive=False),
+            gr.update(interactive=True),
+        )
+
+    def undo_weighted_selection(self):
+        page_state = self.weighted_state
+        undo = page_state.undo_state
+        if not undo:
+            return (
+                None,
+                None,
+                "되돌릴 가중치 선택이 없습니다.",
+                self.format_top_artists_display(POOL_CONTEXT_HALL),
+                "",
+                "",
+                gr.update(interactive=False),
+                gr.update(interactive=False),
+                gr.update(interactive=False),
+            )
+        system = self.hall_elo_system
+        for artist, old_rating in undo.old_ratings.items():
+            if undo.old_rating_presence.get(artist, False):
+                system.ratings[artist] = old_rating
+            else:
+                system.ratings.pop(artist, None)
+        for artist, old_count in undo.old_comparisons.items():
+            if undo.old_comparison_presence.get(artist, False):
+                system.artist_comparisons[artist] = old_count
+            else:
+                system.artist_comparisons.pop(artist, None)
+        for artist, old_modes in undo.old_mode_comparisons.items():
+            if undo.old_mode_presence.get(artist, False):
+                system.mode_comparisons[artist] = dict(old_modes)
+            else:
+                system.mode_comparisons.pop(artist, None)
+        for artist, old_exposure in undo.old_weighted_exposure.items():
+            if undo.old_exposure_presence.get(artist, False):
+                system.weighted_exposure[artist] = old_exposure
+            else:
+                system.weighted_exposure.pop(artist, None)
+        system.comparison_count = undo.old_total_comparisons
+        system.save(HALL_OF_FAME_ELO_FILE)
+        self.history.records = [
+            record for record in self.history.records
+            if record.get("timestamp") != undo.history_timestamp
+        ]
+        self.history.save()
+        page_state.image_a = Path(undo.prev_image_a) if undo.prev_image_a else None
+        page_state.image_b = Path(undo.prev_image_b) if undo.prev_image_b else None
+        page_state.artists_a = undo.prev_artists_a.copy()
+        page_state.artists_b = undo.prev_artists_b.copy()
+        page_state.weights_a = undo.prev_weights_a.copy()
+        page_state.weights_b = undo.prev_weights_b.copy()
+        page_state.generation_settings = GenerationSettings.from_dict(
+            undo.prev_generation_settings
+        )
+        page_state.pair_seed = undo.prev_pair_seed
+        page_state.selection_made = False
+        page_state.undo_state = None
+        self.save_weighted_comparison()
+        return (
+            str(page_state.image_a) if page_state.image_a else None,
+            str(page_state.image_b) if page_state.image_b else None,
+            "**가중치 선택을 되돌렸습니다.** 다시 선택할 수 있습니다.",
+            self.format_top_artists_display(POOL_CONTEXT_HALL),
+            "",
+            "",
+            gr.update(interactive=True),
+            gr.update(interactive=True),
+            gr.update(interactive=False),
+        )
+
+    def _create_ui_legacy(self) -> gr.Blocks:
         """Create the Gradio interface."""
 
         current_settings = self.current_generation_settings
@@ -3990,6 +5293,1137 @@ class ArtistELORanker:
                     return [];
                 }
                 """
+            )
+
+        return app
+
+    def create_ui(self) -> gr.Blocks:
+        """Create the simplified two-page, mobile-first interface."""
+        current_settings = self.current_generation_settings
+
+        with gr.Blocks(title="Artist ELO Ranker") as app:
+            with gr.Row(elem_id="top-bar"):
+                gr.Markdown("# Artist ELO", elem_id="top-bar-title")
+                anlas_display = gr.Markdown(
+                    self.format_anlas_display(),
+                    elem_id="anlas-balance",
+                )
+            with gr.Column(elem_id="app-header"):
+                gr.Markdown(
+                    "전체 작가 풀과 명예의 전당을 각각 평가합니다. "
+                    "작가 태그는 선택 전까지 숨길 수 있습니다."
+                )
+
+            with gr.Accordion("NAI 설정 · 프롬프트 프리셋", open=False):
+                with gr.Column(elem_id="nai-settings-panel"):
+                    with gr.Row(elem_id="resolution-row"):
+                        resolution_dropdown = gr.Dropdown(
+                            label="Image Settings",
+                            choices=[
+                                (preset["label"], key)
+                                for key, preset in RESOLUTION_PRESETS.items()
+                            ],
+                            value=current_settings.resolution_key,
+                            interactive=True,
+                        )
+                        dimension_display = gr.Textbox(
+                            label="Resolution",
+                            value=current_settings.dimension_text,
+                            interactive=False,
+                            elem_id="dimension-display",
+                        )
+                    gr.Markdown(
+                        "🖼️ **비교 이미지 · 후보당 1장**",
+                        elem_id="image-count-note",
+                    )
+                    with gr.Row():
+                        gr.Markdown("### AI Settings")
+                        settings_reset_btn = gr.Button(
+                            "↻ 기본값",
+                            size="sm",
+                            elem_id="settings-reset",
+                        )
+                    steps_slider = gr.Slider(
+                        1,
+                        50,
+                        step=1,
+                        value=current_settings.steps,
+                        label="Steps",
+                    )
+                    with gr.Row():
+                        guidance_slider = gr.Slider(
+                            0,
+                            10,
+                            step=0.1,
+                            value=current_settings.guidance,
+                            label="Prompt Guidance",
+                        )
+                        variety_toggle = gr.Checkbox(
+                            label="Variety+",
+                            value=current_settings.variety_boost,
+                        )
+                    with gr.Row(elem_id="seed-sampler-row"):
+                        seed_input = gr.Textbox(
+                            label="Seed",
+                            value=(
+                                str(current_settings.seed)
+                                if current_settings.seed is not None
+                                else ""
+                            ),
+                            placeholder="비우면 매 비교마다 새 시드",
+                        )
+                        sampler_dropdown = gr.Dropdown(
+                            label="Sampler",
+                            choices=[
+                                (option["label"], key)
+                                for key, option in SAMPLER_OPTIONS.items()
+                            ],
+                            value=current_settings.sampler_key,
+                            interactive=True,
+                        )
+                    with gr.Accordion("Advanced Settings", open=False):
+                        guidance_rescale_slider = gr.Slider(
+                            0,
+                            1,
+                            step=0.02,
+                            value=current_settings.guidance_rescale,
+                            label="Prompt Guidance Rescale",
+                        )
+                        noise_schedule_dropdown = gr.Dropdown(
+                            label="Noise Schedule",
+                            choices=[
+                                (option["label"], key)
+                                for key, option in NOISE_SCHEDULE_OPTIONS.items()
+                            ],
+                            value=current_settings.noise_schedule_key,
+                            interactive=True,
+                        )
+                    gr.Markdown("### Prompt")
+                    prompt_input = gr.Textbox(
+                        label="프롬프트",
+                        value=self.current_custom_prompt,
+                        placeholder=(
+                            "비우면 기본 프롬프트를 사용합니다. "
+                            "작가 태그는 자동으로 삽입됩니다."
+                        ),
+                        lines=4,
+                    )
+                    negative_prompt_input = gr.Textbox(
+                        label="네거티브 프롬프트",
+                        value=self.current_negative_prompt,
+                        placeholder="비우면 기본 네거티브 프롬프트를 사용합니다.",
+                        lines=3,
+                    )
+                    with gr.Row():
+                        quality_toggle = gr.Checkbox(
+                            label="품질 태그 추가",
+                            value=current_settings.quality_toggle,
+                        )
+                        uc_preset_dropdown = gr.Dropdown(
+                            label="자동 네거티브 프리셋",
+                            choices=[
+                                ("없음", -1),
+                                ("Heavy · 표준 품질 필터", 0),
+                                ("Light · 최소 필터", 1),
+                                ("Human Focus · 인물 중심", 2),
+                                ("Heavy + Anatomy · 신체 보정", 3),
+                            ],
+                            value=current_settings.uc_preset,
+                            interactive=True,
+                        )
+                    gr.Markdown(
+                        "*`{artist_placeholder}` 위치에 작가 태그가 들어갑니다.*"
+                    )
+                    gr.Markdown("### Prompt Presets")
+                    preset_slot = gr.Radio(
+                        choices=[str(slot) for slot in range(1, 11)],
+                        value="1",
+                        label="프리셋 슬롯",
+                        elem_id="preset-slots",
+                    )
+                    with gr.Row(elem_id="preset-actions"):
+                        preset_save_btn = gr.Button(
+                            "💾",
+                            variant="secondary",
+                            elem_id="preset-save",
+                        )
+                        preset_load_btn = gr.Button(
+                            "📂",
+                            variant="secondary",
+                            elem_id="preset-load",
+                        )
+                    preset_status = gr.Markdown(
+                        "번호를 고른 뒤 💾 저장 또는 📂 불러오기를 누르세요.",
+                        elem_id="preset-status",
+                    )
+
+            with gr.Tabs():
+                with gr.Tab("랭킹", id="ranking-page"):
+                    with gr.Row():
+                        pool_context_dropdown = gr.Dropdown(
+                            label="평가할 풀",
+                            choices=POOL_CONTEXT_CHOICES,
+                            value=self.current_pool_context,
+                            interactive=True,
+                        )
+                        hall_mode_dropdown = gr.Dropdown(
+                            label="명예의 전당 방식",
+                            choices=HALL_MODE_CHOICES,
+                            value=(
+                                self.current_comparison_mode
+                                if self.current_comparison_mode in {
+                                    COMPARISON_MODE_NORMAL,
+                                    COMPARISON_MODE_SOLO,
+                                }
+                                else COMPARISON_MODE_NORMAL
+                            ),
+                            visible=(
+                                self.current_pool_context == POOL_CONTEXT_HALL
+                            ),
+                            interactive=True,
+                        )
+
+                    with gr.Accordion(
+                        "임시 작가 리스트 · 전체 풀 투입",
+                        open=False,
+                    ):
+                        gr.Markdown(
+                            "텍스트에서 등록된 작가만 추출합니다. 임시 모드에서는 "
+                            "A/B 조합에 임시 작가가 반드시 포함되고, 투표 후 전체 풀로 편입됩니다."
+                        )
+                        temporary_pool_input = gr.Textbox(
+                            label="작가 목록 또는 통계 표",
+                            value=self.artist_manager.get_temporary_pool_text(),
+                            lines=6,
+                        )
+                        with gr.Row():
+                            temporary_pool_start_btn = gr.Button(
+                                "🔎 추출하고 시작",
+                                variant="primary",
+                            )
+                            temporary_pool_stop_btn = gr.Button(
+                                "임시 모드 종료",
+                                variant="secondary",
+                            )
+                        temporary_pool_status = gr.Markdown(
+                            self.format_temporary_pool_status()
+                        )
+
+                    pool_badge = gr.Markdown(
+                        self.format_pool_badge(self.current_pool_context),
+                        elem_id="pool-badge",
+                    )
+                    status_msg = gr.Markdown(
+                        "비교 이미지를 준비하고 있습니다…",
+                        elem_id="status-card",
+                    )
+                    with gr.Row(elem_id="comparison-row"):
+                        with gr.Column(elem_classes=["image-card"]):
+                            image_a = gr.Image(
+                                label="이미지 A",
+                                type="filepath",
+                                buttons=["fullscreen"],
+                                elem_classes=["comparison-image"],
+                            )
+                            with gr.Row(elem_classes=["image-action-row"]):
+                                star_a_btn = gr.Button("☆", size="sm")
+                                heart_a_btn = gr.Button("♡̸", size="sm")
+                            artists_a_display = gr.Markdown("", visible=False)
+                        with gr.Column(elem_classes=["image-card"]):
+                            image_b = gr.Image(
+                                label="이미지 B",
+                                type="filepath",
+                                buttons=["fullscreen"],
+                                elem_classes=["comparison-image"],
+                            )
+                            with gr.Row(elem_classes=["image-action-row"]):
+                                star_b_btn = gr.Button("☆", size="sm")
+                                heart_b_btn = gr.Button("♡̸", size="sm")
+                            artists_b_display = gr.Markdown("", visible=False)
+                    with gr.Row(elem_id="vote-dock"):
+                        pick_a_btn = gr.Button(
+                            "A 선택",
+                            variant="primary",
+                            size="lg",
+                            elem_id="vote-a",
+                        )
+                        pick_b_btn = gr.Button(
+                            "B 선택",
+                            variant="primary",
+                            size="lg",
+                            elem_id="vote-b",
+                        )
+                    with gr.Row(elem_id="secondary-actions"):
+                        skip_btn = gr.Button(
+                            "건너뛰기 / 새 비교",
+                            variant="secondary",
+                            size="sm",
+                            elem_id="skip-button",
+                        )
+                        undo_btn = gr.Button(
+                            "마지막 선택 되돌리기",
+                            variant="stop",
+                            size="sm",
+                            interactive=False,
+                            elem_id="undo-button",
+                        )
+                    show_artists_toggle = gr.Checkbox(
+                        label="작가 태그 보기",
+                        value=False,
+                    )
+                    result_msg = gr.Markdown("")
+                    details_msg = gr.Markdown("")
+
+                with gr.Tab("가중치 조합", id="weighted-page"):
+                    gr.Markdown(
+                        "### 명예의 전당 가중치 조합\n"
+                        "A/B에 서로 겹치지 않는 3~10명의 작가를 배치하고, "
+                        "각 작가에 `0.5~2.0` 가중치를 적용합니다."
+                    )
+                    with gr.Row():
+                        weighted_count = gr.Slider(
+                            WEIGHTED_MIN_ARTISTS,
+                            WEIGHTED_MAX_ARTISTS,
+                            step=1,
+                            value=WEIGHTED_MIN_ARTISTS,
+                            label="조합당 작가 수",
+                        )
+                        weighted_generate_btn = gr.Button(
+                            "가중치 비교 생성",
+                            variant="primary",
+                        )
+                    weighted_capacity = gr.Markdown(
+                        f"현재 명예의 전당 {len(self.hall_pool.artists)}명 · "
+                        "선택 인원의 두 배가 필요합니다."
+                    )
+                    weighted_pool_badge = gr.Markdown(
+                        self.format_pool_badge(POOL_CONTEXT_HALL),
+                        elem_id="weighted-pool-badge",
+                    )
+                    weighted_status = gr.Markdown(
+                        "가중치 비교 생성 버튼을 누르세요.",
+                        elem_id="weighted-status-card",
+                    )
+                    with gr.Row(elem_id="weighted-comparison-row"):
+                        with gr.Column(elem_classes=["image-card"]):
+                            weighted_image_a = gr.Image(
+                                label="가중치 이미지 A",
+                                type="filepath",
+                                buttons=["fullscreen"],
+                                elem_classes=["comparison-image"],
+                            )
+                            with gr.Row(elem_classes=["image-action-row"]):
+                                weighted_star_a_btn = gr.Button("★", size="sm")
+                            weighted_artists_a = gr.Markdown("", visible=False)
+                        with gr.Column(elem_classes=["image-card"]):
+                            weighted_image_b = gr.Image(
+                                label="가중치 이미지 B",
+                                type="filepath",
+                                buttons=["fullscreen"],
+                                elem_classes=["comparison-image"],
+                            )
+                            with gr.Row(elem_classes=["image-action-row"]):
+                                weighted_star_b_btn = gr.Button("★", size="sm")
+                            weighted_artists_b = gr.Markdown("", visible=False)
+                    with gr.Row(elem_id="weighted-vote-dock"):
+                        weighted_pick_a = gr.Button(
+                            "A 선택",
+                            variant="primary",
+                            size="lg",
+                        )
+                        weighted_pick_b = gr.Button(
+                            "B 선택",
+                            variant="primary",
+                            size="lg",
+                        )
+                    with gr.Row():
+                        weighted_skip = gr.Button("건너뛰기 / 새 비교")
+                        weighted_undo = gr.Button(
+                            "마지막 선택 되돌리기",
+                            variant="stop",
+                            interactive=False,
+                        )
+                    weighted_show_artists = gr.Checkbox(
+                        label="작가·가중치 보기",
+                        value=False,
+                    )
+                    weighted_result = gr.Markdown("")
+                    weighted_details = gr.Markdown("")
+                    with gr.Accordion("명예의 전당 랭킹", open=False):
+                        weighted_leaderboard = gr.Markdown(
+                            self.format_top_artists_display(POOL_CONTEXT_HALL)
+                        )
+
+            with gr.Accordion("랭킹과 풀 통계", open=True):
+                leaderboard = gr.Markdown(
+                    self.format_top_artists_display(self.current_pool_context)
+                )
+            with gr.Row():
+                export_btn = gr.Button("랭킹 CSV 내보내기")
+                export_file = gr.File(label="Download", visible=False)
+            with gr.Accordion("최근 비교 기록", open=False):
+                history_display = gr.Markdown(self.format_recent_history())
+
+            shared_generation_inputs = [
+                prompt_input,
+                negative_prompt_input,
+                quality_toggle,
+                uc_preset_dropdown,
+                resolution_dropdown,
+                steps_slider,
+                guidance_slider,
+                variety_toggle,
+                seed_input,
+                sampler_dropdown,
+                guidance_rescale_slider,
+                noise_schedule_dropdown,
+            ]
+            ranking_generation_inputs = shared_generation_inputs + [
+                pool_context_dropdown,
+                hall_mode_dropdown,
+            ]
+            weighted_generation_inputs = [
+                prompt_input,
+                negative_prompt_input,
+                quality_toggle,
+                uc_preset_dropdown,
+                weighted_count,
+                resolution_dropdown,
+                steps_slider,
+                guidance_slider,
+                variety_toggle,
+                seed_input,
+                sampler_dropdown,
+                guidance_rescale_slider,
+                noise_schedule_dropdown,
+            ]
+
+            ranking_outputs = [
+                image_a,
+                image_b,
+                status_msg,
+                pool_badge,
+                anlas_display,
+                leaderboard,
+                result_msg,
+                details_msg,
+                pick_a_btn,
+                pick_b_btn,
+                undo_btn,
+                artists_a_display,
+                artists_b_display,
+                history_display,
+                star_a_btn,
+                star_b_btn,
+                heart_a_btn,
+                heart_b_btn,
+            ]
+            weighted_outputs = [
+                weighted_image_a,
+                weighted_image_b,
+                weighted_status,
+                weighted_pool_badge,
+                anlas_display,
+                weighted_leaderboard,
+                weighted_result,
+                weighted_details,
+                weighted_pick_a,
+                weighted_pick_b,
+                weighted_undo,
+                weighted_artists_a,
+                weighted_artists_b,
+                history_display,
+                weighted_star_a_btn,
+                weighted_star_b_btn,
+            ]
+
+            def run_async(coroutine):
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    return loop.run_until_complete(coroutine)
+                finally:
+                    loop.close()
+
+            def ranking_action_updates():
+                updates = []
+                for side, artists in (
+                    ("A", self.current_artists_a),
+                    ("B", self.current_artists_b),
+                ):
+                    action = self.current_side_actions.get(side)
+                    all_hall = bool(artists) and all(
+                        artist in self.hall_pool.artists for artist in artists
+                    )
+                    star_value = (
+                        "★"
+                        if self.current_pool_context == POOL_CONTEXT_HALL
+                        or all_hall
+                        else "☆"
+                    )
+                    star_interactive = bool(artists) and action not in {
+                        "removed",
+                        "returned",
+                    }
+                    heart_visible = (
+                        self.current_pool_context == POOL_CONTEXT_MAIN
+                    )
+                    heart_value = "💔" if action == "removed" else "♡̸"
+                    heart_interactive = (
+                        bool(artists)
+                        and heart_visible
+                        and action is None
+                    )
+                    updates.extend([
+                        gr.update(
+                            value=star_value,
+                            interactive=star_interactive,
+                        ),
+                        gr.update(
+                            value=heart_value,
+                            visible=heart_visible,
+                            interactive=heart_interactive,
+                        ),
+                    ])
+                # Convert side-major [starA, heartA, starB, heartB] to output order.
+                return updates[0], updates[2], updates[1], updates[3]
+
+            def weighted_star_updates():
+                return tuple(
+                    gr.update(
+                        value="★",
+                        interactive=(
+                            bool(artists)
+                            and self.weighted_state.side_actions.get(side) is None
+                        ),
+                    )
+                    for side, artists in (
+                        ("A", self.weighted_state.artists_a),
+                        ("B", self.weighted_state.artists_b),
+                    )
+                )
+
+            def ranking_extras():
+                return (
+                    (
+                        f"**작가:** {', '.join(self.current_artists_a)}"
+                        if self.current_artists_a else ""
+                    ),
+                    (
+                        f"**작가:** {', '.join(self.current_artists_b)}"
+                        if self.current_artists_b else ""
+                    ),
+                    self.format_recent_history(),
+                    *ranking_action_updates(),
+                )
+
+            def weighted_extras():
+                return (
+                    self.format_weighted_side(
+                        self.weighted_state.artists_a,
+                        self.weighted_state.weights_a,
+                    ),
+                    self.format_weighted_side(
+                        self.weighted_state.artists_b,
+                        self.weighted_state.weights_b,
+                    ),
+                    self.format_recent_history(),
+                    *weighted_star_updates(),
+                )
+
+            def on_generate_ranking(
+                prompt,
+                negative_prompt,
+                quality_tags,
+                uc_preset,
+                resolution_key,
+                steps,
+                guidance,
+                variety_boost,
+                seed,
+                sampler_key,
+                guidance_rescale,
+                noise_schedule_key,
+                pool_context,
+                hall_mode,
+            ):
+                result = run_async(self.generate_new_comparison(
+                    prompt,
+                    negative_prompt,
+                    quality_tags,
+                    uc_preset,
+                    resolution_key=resolution_key,
+                    steps=steps,
+                    guidance=guidance,
+                    variety_boost=variety_boost,
+                    seed=seed,
+                    sampler_key=sampler_key,
+                    guidance_rescale=guidance_rescale,
+                    noise_schedule_key=noise_schedule_key,
+                    pool_context=pool_context,
+                    hall_mode=hall_mode,
+                ))
+                return result + ranking_extras()
+
+            def on_initial_ranking(*values):
+                has_saved = (
+                    self.current_image_a
+                    and self.current_image_b
+                    and self.current_image_a.is_file()
+                    and self.current_image_b.is_file()
+                    and self.current_artists_a
+                    and self.current_artists_b
+                )
+                if not has_saved:
+                    return on_generate_ranking(*values)
+                run_async(self.refresh_anlas_balance())
+                can_pick = not self.selection_made
+                core = (
+                    str(self.current_image_a),
+                    str(self.current_image_b),
+                    (
+                        "저장된 비교를 불러왔습니다."
+                        if can_pick
+                        else "이미 처리한 비교입니다. 새 비교를 생성하세요."
+                    ),
+                    self.format_pool_badge(self.current_pool_context),
+                    self.format_anlas_display(),
+                    self.format_top_artists_display(self.current_pool_context),
+                    "",
+                    "",
+                    gr.update(interactive=can_pick),
+                    gr.update(interactive=can_pick),
+                    gr.update(interactive=self.last_undo_state is not None),
+                )
+                return core + ranking_extras()
+
+            def on_generate_weighted(*values):
+                result = run_async(self.generate_weighted_comparison(*values))
+                return result + weighted_extras()
+
+            def on_initial_weighted():
+                state = self.weighted_state
+                has_saved = (
+                    state.image_a
+                    and state.image_b
+                    and state.image_a.is_file()
+                    and state.image_b.is_file()
+                )
+                if not has_saved:
+                    core = (
+                        None,
+                        None,
+                        "가중치 비교 생성 버튼을 누르세요.",
+                        self.format_pool_badge(POOL_CONTEXT_HALL),
+                        self.format_anlas_display(),
+                        self.format_top_artists_display(POOL_CONTEXT_HALL),
+                        "",
+                        "",
+                        gr.update(interactive=False),
+                        gr.update(interactive=False),
+                        gr.update(interactive=False),
+                    )
+                else:
+                    can_pick = not state.selection_made
+                    core = (
+                        str(state.image_a),
+                        str(state.image_b),
+                        (
+                            "저장된 가중치 비교를 불러왔습니다."
+                            if can_pick
+                            else "이미 처리한 가중치 비교입니다."
+                        ),
+                        self.format_pool_badge(POOL_CONTEXT_HALL),
+                        self.format_anlas_display(),
+                        self.format_top_artists_display(POOL_CONTEXT_HALL),
+                        "",
+                        "",
+                        gr.update(interactive=can_pick),
+                        gr.update(interactive=can_pick),
+                        gr.update(interactive=state.undo_state is not None),
+                    )
+                return core + weighted_extras()
+
+            def on_export():
+                filepath = COMPARISON_IMAGES_DIR / "leaderboard_export.csv"
+                filepath.parent.mkdir(parents=True, exist_ok=True)
+                with open(filepath, "w", encoding="utf-8", newline="") as f:
+                    f.write(self.export_leaderboard_csv())
+                return str(filepath)
+
+            def on_pool_context_change(pool_context):
+                return (
+                    gr.update(visible=pool_context == POOL_CONTEXT_HALL),
+                    self.format_pool_badge(pool_context),
+                    self.format_top_artists_display(pool_context),
+                    (
+                        "다음 비교부터 명예의 전당 방식을 사용합니다."
+                        if pool_context == POOL_CONTEXT_HALL
+                        else "다음 비교부터 전체 작가 풀을 사용합니다."
+                    ),
+                )
+
+            def on_temporary_pool_start(text, pool_context):
+                artists, ignored_count = self.artist_manager.extract_artists_from_text(text)
+                cleaned = "\n".join(artists)
+                if len(artists) < 2:
+                    message = (
+                        f"**시작할 수 없습니다.** 확인된 작가 {len(artists)}명 · "
+                        f"제거한 항목 {ignored_count}개 · 최소 2명이 필요합니다."
+                    )
+                else:
+                    self.artist_manager.activate_temporary_pool(artists)
+                    message = (
+                        f"확인된 작가 {len(artists)}명 · 제거한 항목 {ignored_count}개  \n"
+                        + self.format_temporary_pool_status()
+                    )
+                return (
+                    cleaned,
+                    message,
+                    self.format_pool_badge(pool_context),
+                    self.format_top_artists_display(pool_context),
+                )
+
+            def on_temporary_pool_stop(pool_context):
+                self.artist_manager.deactivate_temporary_pool()
+                return (
+                    self.format_temporary_pool_status(),
+                    self.format_pool_badge(pool_context),
+                    self.format_top_artists_display(pool_context),
+                )
+
+            def on_rank_star(side):
+                message, _ = self.apply_star_action(side)
+                can_pick = not self.selection_made
+                return (
+                    message,
+                    self.format_pool_badge(self.current_pool_context),
+                    self.format_pool_badge(POOL_CONTEXT_HALL),
+                    self.format_top_artists_display(self.current_pool_context),
+                    self.format_top_artists_display(POOL_CONTEXT_HALL),
+                    gr.update(interactive=can_pick),
+                    gr.update(interactive=can_pick),
+                    *ranking_action_updates(),
+                    self.format_temporary_pool_status(),
+                    self.format_recent_history(),
+                    f"현재 명예의 전당 {len(self.hall_pool.artists)}명 · 선택 인원의 두 배가 필요합니다.",
+                )
+
+            def on_rank_heart(side):
+                message, _ = self.apply_broken_heart(side)
+                can_pick = not self.selection_made
+                return (
+                    message,
+                    self.format_pool_badge(self.current_pool_context),
+                    self.format_top_artists_display(self.current_pool_context),
+                    gr.update(interactive=can_pick),
+                    gr.update(interactive=can_pick),
+                    *ranking_action_updates(),
+                    self.format_temporary_pool_status(),
+                )
+
+            def on_weighted_star(side):
+                message, _ = self.apply_star_action(side, weighted=True)
+                can_pick = not self.weighted_state.selection_made
+                return (
+                    message,
+                    self.format_pool_badge(POOL_CONTEXT_HALL),
+                    self.format_pool_badge(self.current_pool_context),
+                    self.format_top_artists_display(POOL_CONTEXT_HALL),
+                    self.format_top_artists_display(self.current_pool_context),
+                    gr.update(interactive=can_pick),
+                    gr.update(interactive=can_pick),
+                    *weighted_star_updates(),
+                    f"현재 명예의 전당 {len(self.hall_pool.artists)}명 · 선택 인원의 두 배가 필요합니다.",
+                )
+
+            def on_rank_undo():
+                result = self.undo_last_selection()
+                return (
+                    *result,
+                    self.format_pool_badge(self.current_pool_context),
+                    *ranking_extras(),
+                )
+
+            def on_weighted_undo():
+                result = self.undo_weighted_selection()
+                return result + weighted_extras()
+
+            def on_reset_settings():
+                settings = GenerationSettings()
+                return (
+                    settings.resolution_key,
+                    settings.dimension_text,
+                    settings.steps,
+                    settings.guidance,
+                    settings.variety_boost,
+                    "",
+                    settings.sampler_key,
+                    settings.guidance_rescale,
+                    settings.noise_schedule_key,
+                    settings.quality_toggle,
+                    settings.uc_preset,
+                    "이미지 생성 설정을 기본값으로 되돌렸습니다.",
+                )
+
+            def on_save_preset(
+                slot,
+                prompt,
+                negative_prompt,
+                resolution_key,
+                steps,
+                guidance,
+                variety_boost,
+                seed,
+                sampler_key,
+                guidance_rescale,
+                noise_schedule_key,
+                quality_tags,
+                uc_preset,
+            ):
+                try:
+                    settings = GenerationSettings.from_values(
+                        resolution_key,
+                        steps,
+                        guidance,
+                        sampler_key,
+                        seed,
+                        variety_boost,
+                        guidance_rescale,
+                        noise_schedule_key,
+                        quality_tags,
+                        uc_preset,
+                    )
+                    return self.save_prompt_preset(
+                        slot,
+                        prompt,
+                        negative_prompt,
+                        settings,
+                    )
+                except (OSError, ValueError) as exc:
+                    return f"프리셋 저장 실패: {exc}"
+
+            def on_load_preset(slot):
+                try:
+                    prompt, negative_prompt, settings = self.load_prompt_preset(slot)
+                    return (
+                        prompt,
+                        negative_prompt,
+                        settings.resolution_key,
+                        settings.dimension_text,
+                        settings.steps,
+                        settings.guidance,
+                        settings.variety_boost,
+                        str(settings.seed) if settings.seed is not None else "",
+                        settings.sampler_key,
+                        settings.guidance_rescale,
+                        settings.noise_schedule_key,
+                        settings.quality_toggle,
+                        settings.uc_preset,
+                        f"프리셋 {int(slot)}번을 불러왔습니다.",
+                    )
+                except ValueError as exc:
+                    return (*([gr.skip()] * 13), str(exc))
+
+            pool_context_dropdown.change(
+                fn=on_pool_context_change,
+                inputs=[pool_context_dropdown],
+                outputs=[hall_mode_dropdown, pool_badge, leaderboard, status_msg],
+            )
+            temporary_pool_start_btn.click(
+                fn=on_temporary_pool_start,
+                inputs=[temporary_pool_input, pool_context_dropdown],
+                outputs=[
+                    temporary_pool_input,
+                    temporary_pool_status,
+                    pool_badge,
+                    leaderboard,
+                ],
+            )
+            temporary_pool_stop_btn.click(
+                fn=on_temporary_pool_stop,
+                inputs=[pool_context_dropdown],
+                outputs=[temporary_pool_status, pool_badge, leaderboard],
+            )
+            resolution_dropdown.change(
+                fn=lambda key: RESOLUTION_PRESETS.get(
+                    key,
+                    RESOLUTION_PRESETS[_default_resolution_key()],
+                )["label"] and (
+                    f"{RESOLUTION_PRESETS.get(key, RESOLUTION_PRESETS[_default_resolution_key()])['width']} × "
+                    f"{RESOLUTION_PRESETS.get(key, RESOLUTION_PRESETS[_default_resolution_key()])['height']}"
+                ),
+                inputs=[resolution_dropdown],
+                outputs=[dimension_display],
+            )
+            settings_reset_btn.click(
+                fn=on_reset_settings,
+                outputs=[
+                    resolution_dropdown,
+                    dimension_display,
+                    steps_slider,
+                    guidance_slider,
+                    variety_toggle,
+                    seed_input,
+                    sampler_dropdown,
+                    guidance_rescale_slider,
+                    noise_schedule_dropdown,
+                    quality_toggle,
+                    uc_preset_dropdown,
+                    preset_status,
+                ],
+            )
+            preset_save_btn.click(
+                fn=on_save_preset,
+                inputs=[
+                    preset_slot,
+                    prompt_input,
+                    negative_prompt_input,
+                    resolution_dropdown,
+                    steps_slider,
+                    guidance_slider,
+                    variety_toggle,
+                    seed_input,
+                    sampler_dropdown,
+                    guidance_rescale_slider,
+                    noise_schedule_dropdown,
+                    quality_toggle,
+                    uc_preset_dropdown,
+                ],
+                outputs=[preset_status],
+            )
+            preset_load_btn.click(
+                fn=on_load_preset,
+                inputs=[preset_slot],
+                outputs=[
+                    prompt_input,
+                    negative_prompt_input,
+                    resolution_dropdown,
+                    dimension_display,
+                    steps_slider,
+                    guidance_slider,
+                    variety_toggle,
+                    seed_input,
+                    sampler_dropdown,
+                    guidance_rescale_slider,
+                    noise_schedule_dropdown,
+                    quality_toggle,
+                    uc_preset_dropdown,
+                    preset_status,
+                ],
+            )
+
+            app.load(
+                fn=on_initial_ranking,
+                inputs=ranking_generation_inputs,
+                outputs=ranking_outputs,
+            )
+            app.load(fn=on_initial_weighted, outputs=weighted_outputs)
+
+            pick_a_btn.click(
+                fn=lambda: self.pick_winner("A"),
+                outputs=[
+                    result_msg,
+                    details_msg,
+                    leaderboard,
+                    pick_a_btn,
+                    pick_b_btn,
+                    undo_btn,
+                ],
+            ).then(
+                fn=on_generate_ranking,
+                inputs=ranking_generation_inputs,
+                outputs=ranking_outputs,
+            ).then(fn=on_export, outputs=[export_file])
+            pick_b_btn.click(
+                fn=lambda: self.pick_winner("B"),
+                outputs=[
+                    result_msg,
+                    details_msg,
+                    leaderboard,
+                    pick_a_btn,
+                    pick_b_btn,
+                    undo_btn,
+                ],
+            ).then(
+                fn=on_generate_ranking,
+                inputs=ranking_generation_inputs,
+                outputs=ranking_outputs,
+            ).then(fn=on_export, outputs=[export_file])
+            skip_btn.click(
+                fn=on_generate_ranking,
+                inputs=ranking_generation_inputs,
+                outputs=ranking_outputs,
+            )
+
+            rank_action_outputs = [
+                status_msg,
+                pool_badge,
+                weighted_pool_badge,
+                leaderboard,
+                weighted_leaderboard,
+                pick_a_btn,
+                pick_b_btn,
+                star_a_btn,
+                star_b_btn,
+                heart_a_btn,
+                heart_b_btn,
+                temporary_pool_status,
+                history_display,
+                weighted_capacity,
+            ]
+            star_a_btn.click(
+                fn=lambda: on_rank_star("A"),
+                outputs=rank_action_outputs,
+            )
+            star_b_btn.click(
+                fn=lambda: on_rank_star("B"),
+                outputs=rank_action_outputs,
+            )
+            heart_action_outputs = [
+                status_msg,
+                pool_badge,
+                leaderboard,
+                pick_a_btn,
+                pick_b_btn,
+                star_a_btn,
+                star_b_btn,
+                heart_a_btn,
+                heart_b_btn,
+                temporary_pool_status,
+            ]
+            heart_a_btn.click(
+                fn=lambda: on_rank_heart("A"),
+                outputs=heart_action_outputs,
+            )
+            heart_b_btn.click(
+                fn=lambda: on_rank_heart("B"),
+                outputs=heart_action_outputs,
+            )
+            show_artists_toggle.change(
+                fn=lambda show: (
+                    gr.update(visible=show),
+                    gr.update(visible=show),
+                ),
+                inputs=[show_artists_toggle],
+                outputs=[artists_a_display, artists_b_display],
+            )
+
+            rank_undo_outputs = [
+                image_a,
+                image_b,
+                status_msg,
+                leaderboard,
+                result_msg,
+                details_msg,
+                pick_a_btn,
+                pick_b_btn,
+                undo_btn,
+                pool_badge,
+                artists_a_display,
+                artists_b_display,
+                history_display,
+                star_a_btn,
+                star_b_btn,
+                heart_a_btn,
+                heart_b_btn,
+            ]
+            undo_btn.click(fn=on_rank_undo, outputs=rank_undo_outputs).then(
+                fn=on_export,
+                outputs=[export_file],
+            )
+
+            weighted_generate_btn.click(
+                fn=on_generate_weighted,
+                inputs=weighted_generation_inputs,
+                outputs=weighted_outputs,
+            )
+            weighted_skip.click(
+                fn=on_generate_weighted,
+                inputs=weighted_generation_inputs,
+                outputs=weighted_outputs,
+            )
+            weighted_pick_a.click(
+                fn=lambda: self.pick_weighted_winner("A"),
+                outputs=[
+                    weighted_result,
+                    weighted_details,
+                    weighted_leaderboard,
+                    weighted_pick_a,
+                    weighted_pick_b,
+                    weighted_undo,
+                ],
+            ).then(
+                fn=on_generate_weighted,
+                inputs=weighted_generation_inputs,
+                outputs=weighted_outputs,
+            ).then(fn=on_export, outputs=[export_file])
+            weighted_pick_b.click(
+                fn=lambda: self.pick_weighted_winner("B"),
+                outputs=[
+                    weighted_result,
+                    weighted_details,
+                    weighted_leaderboard,
+                    weighted_pick_a,
+                    weighted_pick_b,
+                    weighted_undo,
+                ],
+            ).then(
+                fn=on_generate_weighted,
+                inputs=weighted_generation_inputs,
+                outputs=weighted_outputs,
+            ).then(fn=on_export, outputs=[export_file])
+            weighted_action_outputs = [
+                weighted_status,
+                weighted_pool_badge,
+                pool_badge,
+                weighted_leaderboard,
+                leaderboard,
+                weighted_pick_a,
+                weighted_pick_b,
+                weighted_star_a_btn,
+                weighted_star_b_btn,
+                weighted_capacity,
+            ]
+            weighted_star_a_btn.click(
+                fn=lambda: on_weighted_star("A"),
+                outputs=weighted_action_outputs,
+            )
+            weighted_star_b_btn.click(
+                fn=lambda: on_weighted_star("B"),
+                outputs=weighted_action_outputs,
+            )
+            weighted_show_artists.change(
+                fn=lambda show: (
+                    gr.update(visible=show),
+                    gr.update(visible=show),
+                ),
+                inputs=[weighted_show_artists],
+                outputs=[weighted_artists_a, weighted_artists_b],
+            )
+            weighted_undo.click(
+                fn=on_weighted_undo,
+                outputs=[
+                    weighted_image_a,
+                    weighted_image_b,
+                    weighted_status,
+                    weighted_leaderboard,
+                    weighted_result,
+                    weighted_details,
+                    weighted_pick_a,
+                    weighted_pick_b,
+                    weighted_undo,
+                    weighted_artists_a,
+                    weighted_artists_b,
+                    history_display,
+                    weighted_star_a_btn,
+                    weighted_star_b_btn,
+                ],
+            ).then(fn=on_export, outputs=[export_file])
+
+            export_btn.click(fn=on_export, outputs=[export_file]).then(
+                fn=lambda: gr.update(visible=True),
+                outputs=[export_file],
             )
 
         return app

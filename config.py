@@ -50,8 +50,11 @@ ELO_RATINGS_FILE = DATA_DIR / "artist_elo_ratings.json"
 COMPARISON_HISTORY_FILE = DATA_DIR / "comparison_history.json"
 ACTIVE_POOL_FILE = DATA_DIR / "active_pool.json"
 CURRENT_COMPARISON_FILE = DATA_DIR / "current_comparison.json"
+WEIGHTED_COMPARISON_FILE = DATA_DIR / "weighted_comparison.json"
 PROMPT_PRESETS_FILE = DATA_DIR / "prompt_presets.json"
 TEMPORARY_POOL_FILE = DATA_DIR / "temporary_pool.json"
+HALL_OF_FAME_POOL_FILE = DATA_DIR / "hall_of_fame_pool.json"
+HALL_OF_FAME_ELO_FILE = DATA_DIR / "hall_of_fame_elo_ratings.json"
 
 
 # --------------------------------------------------------------------------------
