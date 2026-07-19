@@ -10,9 +10,11 @@ A web-based blind comparison system that ranks Danbooru artist tags by generatin
 - **Blind Comparisons**: Compare two AI-generated images without seeing which artists were used (toggleable)
 - **ELO Rating System**: Individual-based ELO calculation with zero-sum enforcement
 - **Active Pool Management**: Moves between roughly 150-200 artists for efficient discovery and replacement
+- **Ranking Views**: Switch main-pool sampling between Default, Top-tier Battles, and Bottom-tier Battles
 - **Smart Rotation**: Low performers are probabilistically rotated out; high ELO artists are more likely to return
 - **Two Independent Pools**: Keep a main-pool ELO and a separate Hall of Fame ELO
-- **Hall of Fame Controls**: Use image-level star and broken-heart controls to promote, restore, or exclude complete artist combinations
+- **Hall of Fame Controls**: Use image-level star controls to promote or restore complete artist combinations
+- **Single Deathmatch Queue**: Broken-heart combinations move to solo UP/DOWN review instead of being removed immediately
 - **Hall of Fame Modes**: Compare Hall of Fame artists as solo tags or normal 1-3 artist combinations
 - **Weighted Combination Lab**: Compare disjoint 3-10 artist Hall of Fame teams with NovelAI weights from 0.5 to 2.0
 - **Undo Support**: Revert the last comparison if you change your mind
@@ -96,6 +98,7 @@ See **[MOBILE_DEPLOY.md](MOBILE_DEPLOY.md)** for the Korean phone-only deploymen
    - Use **건너뛰기 / 새 비교** to generate a new pair without changing ELO
    - Use **마지막 선택 되돌리기** to restore the prior vote and pair
    - Switch between the **랭킹** and **가중치 조합** tabs without losing either page's current images
+   - In the main pool, choose **기본**, **상위권 대결**, or **하위권 대결** before generating the next pair
 
 4. **View rankings**
 
@@ -115,11 +118,12 @@ Each artist entry shows:
 
 ### Two Pools and Image Actions
 
-Choose **전체 작가 풀** or **명예의 전당** above the ranking images.
+Choose **전체 작가 풀**, **명예의 전당**, or **단일 데스매치** above the ranking images.
 
 - In the main pool, `☆` moves every artist used by that image into the Hall of Fame. Their Hall of Fame ELO and comparison count start again at 1500 and zero, while the existing main ELO is preserved.
 - A filled `★` returns those artists to the main pool and restores the preserved main ELO. Entering the Hall of Fame again always starts a new 1500-point Hall of Fame run.
-- The empty broken-heart control excludes every artist used by that main-pool image from future automatic main-pool selection. It is not shown in the Hall of Fame.
+- The empty broken-heart control sends every artist used by that main-pool image to the persistent single-artist deathmatch queue. It does not erase their main ELO.
+- The deathmatch screen generates one solo image for each A/B candidate. Judge each side independently: **UP** restores that artist to the main pool with the existing ELO, while **DOWN** confirms pool-out without deleting the stored ELO. An odd final candidate is shown by itself.
 - Pool actions resolve the current image pair without generating another image. Use the new-comparison button when ready, avoiding an unintended NovelAI charge.
 
 ### Hall of Fame and Weighted Modes
@@ -167,7 +171,7 @@ The list and enabled state are stored in `temporary_pool.json`.
 ### Pool Health & Statistics
 
 The badge above each image pair shows the main-pool count, Hall of Fame count,
-rated artists currently outside both pools, and remaining temporary intake count.
+deathmatch queue count, confirmed pool-out count, and remaining temporary intake count.
 The ranking panel reports the selected pool's comparison total and top 30 members.
 
 ### Export to CSV
@@ -176,7 +180,7 @@ Click "Export Leaderboard as CSV" to download the full leaderboard as a CSV file
 
 <img src="screenshots/export_leaderboard.png" width="400">
 
-- Main rank, artist, and current membership (`main`, `hall_of_fame`, or `out`)
+- Main rank, artist, and current membership (`main`, `hall_of_fame`, `deathmatch`, or `out`)
 - Main ELO/comparisons and separate Hall of Fame ELO/comparisons
 - Wins, losses, and win rate
 - Solo, normal, and weighted-mode appearance counts
