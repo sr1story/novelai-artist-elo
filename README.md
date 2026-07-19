@@ -124,6 +124,7 @@ Choose **전체 작가 풀**, **명예의 전당**, or **단일 데스매치** a
 - A filled `★` returns those artists to the main pool and restores the preserved main ELO. Entering the Hall of Fame again always starts a new 1500-point Hall of Fame run.
 - The empty broken-heart control sends every artist used by that main-pool image to the persistent single-artist deathmatch queue. It does not erase their main ELO.
 - The deathmatch screen generates one solo image for each A/B candidate. Judge each side independently: **UP** restores that artist to the main pool with the existing ELO, while **DOWN** confirms pool-out without deleting the stored ELO. An odd final candidate is shown by itself.
+- On the first deployment of this version, artists previously excluded with the old broken-heart behavior are migrated into the deathmatch queue once.
 - Pool actions resolve the current image pair without generating another image. Use the new-comparison button when ready, avoiding an unintended NovelAI charge.
 
 ### Hall of Fame and Weighted Modes
