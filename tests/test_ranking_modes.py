@@ -14,6 +14,7 @@ from artist_elo_ranker import (
     CANDIDATE_RULE_NEW,
     CANDIDATE_RULE_PROVEN,
     ComparisonHistory,
+    DeathmatchPool,
     ELOSystem,
     GenerationSettings,
     HallOfFamePool,
@@ -24,6 +25,7 @@ from artist_elo_ranker import (
     POOL_ACTION_TRIM_FROM_200,
     POOL_ACTION_TRIM_TO_150,
     POOL_ACTION_TEMPORARY,
+    RANKING_MODE_BOTTOM,
     RANKING_MODE_FAST_ROTATION,
     RANKING_MODE_NEWCOMERS,
     RANKING_MODE_TOP,
@@ -31,6 +33,7 @@ from artist_elo_ranker import (
     COMPARISON_MODE_SOLO,
     COMPARISON_MODE_WEIGHTED,
     generate_comparison_pair,
+    generate_deathmatch_pair,
     generate_image,
 )
 
@@ -538,6 +541,33 @@ class RankingModeTests(unittest.TestCase):
         self.assertEqual(focused, ["top", "second"])
         self.assertNotIn("unrated", focused)
 
+    def test_top_and_bottom_views_focus_opposite_elo_bands(self):
+        artists = [f"artist_{index}" for index in range(10)]
+        ratings = {
+            artist: 1000 + index * 100
+            for index, artist in enumerate(artists)
+        }
+        comparisons = {artist: 5 for artist in artists}
+        pool, _ = self.make_pool(
+            artists,
+            active_artists=artists,
+            ratings=ratings,
+            comparisons=comparisons,
+            pool_size=10,
+        )
+
+        pool.set_ranking_mode(RANKING_MODE_TOP)
+        self.assertEqual(
+            set(pool._get_focus_candidates(artists)),
+            {"artist_7", "artist_8", "artist_9"},
+        )
+
+        pool.set_ranking_mode(RANKING_MODE_BOTTOM)
+        self.assertEqual(
+            set(pool._get_focus_candidates(artists)),
+            {"artist_0", "artist_1", "artist_2"},
+        )
+
     def test_revert_rotation_restores_original_membership(self):
         pool, _ = self.make_pool(["a", "b", "c", "d"], pool_size=3)
         pool.pool = ["a", "b", "c"]
@@ -679,6 +709,60 @@ class RankingModeTests(unittest.TestCase):
         self.assertEqual(main_elo.get_rating("a"), 1777)
         self.assertFalse(ranker.selection_made)
 
+    def test_image_heart_queues_then_independent_up_down_resolves(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        artists = ["a", "b", "c", "d"]
+        main_elo = ELOSystem(ratings={"a": 1750, "b": 1250})
+        main_pool = ActivePool(
+            artists,
+            main_elo,
+            pool_size=4,
+            pool_file=Path(temp_dir.name) / "active_pool.json",
+        )
+        deathmatch = DeathmatchPool(
+            artists,
+            main_pool,
+            Path(temp_dir.name) / "deathmatch.json",
+        )
+        ranker = ArtistELORanker.__new__(ArtistELORanker)
+        ranker.elo_system = main_elo
+        ranker.deathmatch_pool = deathmatch
+        ranker.artist_manager = Mock(
+            active_pool=main_pool,
+            temporary_pool=[],
+            temporary_pool_enabled=False,
+        )
+        ranker.artist_manager.save_temporary_pool = Mock()
+        ranker.current_artists_a = ["a", "b"]
+        ranker.current_artists_b = ["c"]
+        ranker.current_pool_context = "main"
+        ranker.current_side_actions = {"A": None, "B": None}
+        ranker.current_image_a = None
+        ranker.current_image_b = None
+        ranker.selection_made = False
+
+        _, changed = ranker.apply_broken_heart("A")
+        self.assertTrue(changed)
+        self.assertCountEqual(deathmatch.artists, ["a", "b"])
+        self.assertEqual(ranker.current_side_actions["A"], "deathmatch")
+        self.assertEqual(main_elo.get_rating("a"), 1750)
+
+        ranker.current_pool_context = "deathmatch"
+        ranker.current_artists_a = ["a"]
+        ranker.current_artists_b = ["b"]
+        ranker.current_side_actions = {"A": None, "B": None}
+        ranker.selection_made = False
+        _, changed = ranker.apply_deathmatch_decision("A", keep=True)
+        self.assertTrue(changed)
+        self.assertIn("a", main_pool.pool)
+        self.assertFalse(ranker.selection_made)
+
+        _, changed = ranker.apply_deathmatch_decision("B", keep=False)
+        self.assertTrue(changed)
+        self.assertNotIn("b", main_pool.pool)
+        self.assertTrue(ranker.selection_made)
+
     def test_weighted_elo_is_zero_sum_and_scales_artist_influence(self):
         winners = ["winner_high", "winner_low", "winner_mid"]
         losers = ["loser_a", "loser_b", "loser_c"]
@@ -737,6 +821,87 @@ class RankingModeTests(unittest.TestCase):
         self.assertNotIn("a", pool.pool)
         self.assertIn("replacement", pool.pool)
         self.assertIn("a", pool.manual_excluded)
+
+    def test_deathmatch_up_returns_and_down_confirms_pool_out(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        artists = ["a", "b", "c", "replacement"]
+        elo = ELOSystem(
+            ratings={"a": 1725, "b": 1280},
+            artist_comparisons={"a": 8, "b": 8},
+        )
+        main_pool = ActivePool(
+            artists,
+            elo,
+            pool_size=3,
+            pool_file=Path(temp_dir.name) / "active_pool.json",
+        )
+        main_pool.pool = ["a", "b", "c"]
+        main_pool.save()
+        deathmatch_file = Path(temp_dir.name) / "deathmatch.json"
+        deathmatch = DeathmatchPool(
+            artists,
+            main_pool,
+            deathmatch_file,
+        )
+
+        self.assertCountEqual(deathmatch.enqueue(["a", "b"]), ["a", "b"])
+        self.assertNotIn("a", main_pool.pool)
+        self.assertNotIn("b", main_pool.pool)
+        self.assertEqual(main_pool.get_pool_stats()["out_count"], 0)
+        self.assertEqual(elo.get_rating("a"), 1725)
+        self.assertEqual(elo.get_rating("b"), 1280)
+
+        reloaded = DeathmatchPool(
+            artists,
+            main_pool,
+            deathmatch_file,
+        )
+        pair_a, pair_b = reloaded.select_pair()
+        self.assertEqual(len(pair_a), 1)
+        self.assertEqual(len(pair_b), 1)
+        self.assertFalse(set(pair_a) & set(pair_b))
+
+        self.assertTrue(reloaded.resolve("a", keep=True))
+        self.assertIn("a", main_pool.pool)
+        self.assertNotIn("a", main_pool.manual_excluded)
+        self.assertEqual(elo.get_rating("a"), 1725)
+
+        self.assertTrue(reloaded.resolve("b", keep=False))
+        self.assertNotIn("b", main_pool.pool)
+        self.assertIn("b", main_pool.manual_excluded)
+        self.assertEqual(main_pool.get_pool_stats()["out_count"], 1)
+        self.assertEqual(reloaded.artists, [])
+
+    def test_deathmatch_generation_allows_one_final_artist(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        tags_file = Path(temp_dir.name) / "artists.txt"
+        tags_file.write_text("alpha\n", encoding="utf-8")
+        manager = ArtistTagManager(
+            tags_file,
+            ELOSystem(),
+            Path(temp_dir.name) / "temporary_pool.json",
+        )
+
+        with patch(
+            "artist_elo_ranker.generate_image",
+            new=AsyncMock(return_value=True),
+        ) as mocked_generate:
+            path_a, path_b = asyncio.run(generate_deathmatch_pair(
+                "portrait, {artist_placeholder}",
+                manager,
+                Mock(),
+                Path(temp_dir.name),
+                GenerationSettings(),
+                42,
+                ["alpha"],
+                [],
+            ))
+
+        self.assertIsNotNone(path_a)
+        self.assertIsNone(path_b)
+        self.assertEqual(mocked_generate.await_count, 1)
 
     def test_generation_settings_round_trip_all_values(self):
         settings = GenerationSettings.from_values(
