@@ -43,6 +43,7 @@ from config import (
     ACTIVE_POOL_FILE,
     CURRENT_COMPARISON_FILE,
     PROMPT_PRESETS_FILE,
+    TEMPORARY_POOL_FILE,
     STEPS,
     IMG_WIDTH,
     IMG_HEIGHT,
@@ -674,6 +675,7 @@ POOL_ACTION_EXPAND_TO_200 = "expand_to_200"
 POOL_ACTION_TRIM_FROM_200 = "trim_from_200"
 POOL_ACTION_TRIM_TO_150 = "trim_to_150"
 POOL_ACTION_REFILL_FROM_150 = "refill_from_150"
+POOL_ACTION_TEMPORARY = "temporary_pool"
 
 
 def normalize_ranking_mode(mode: str) -> str:
@@ -719,6 +721,8 @@ def get_pool_action_status(pool_action: str) -> str:
         return "ELO 최하위 작가 생존 비교입니다. 선택한 뒤 패자는 활성 풀에서 제외됩니다."
     if pool_action == POOL_ACTION_CALIBRATE_SOLO:
         return "교체 후보 판정을 위한 단일 비교입니다. 이번 비교에서는 풀을 교체하지 않습니다."
+    if pool_action == POOL_ACTION_TEMPORARY:
+        return "임시 풀 단독 비교입니다. ELO와 기록만 저장되며 활성 풀은 변경되지 않습니다."
     return "이미지가 생성되었습니다. 더 마음에 드는 쪽을 선택하세요."
 
 
@@ -1570,12 +1574,25 @@ class ActivePool:
 class ArtistTagManager:
     """Manages loading and selecting artist tags."""
 
-    def __init__(self, tags_file: Path, elo_system: ELOSystem = None):
+    def __init__(
+        self,
+        tags_file: Path,
+        elo_system: ELOSystem = None,
+        temporary_pool_file: Path = None,
+    ):
         self.tags_file = tags_file
         self.artists: List[str] = []
         self.elo_system = elo_system
         self.active_pool: Optional[ActivePool] = None
+        self.temporary_pool_file = temporary_pool_file or TEMPORARY_POOL_FILE
+        self.temporary_pool: List[str] = []
+        self.temporary_pool_enabled = False
+        self._artist_set = set()
+        self._artist_exact_lookup: Dict[str, str] = {}
+        self._artist_alias_lookup: Dict[str, str] = {}
         self.load_artists()
+        self._build_artist_lookup()
+        self.load_temporary_pool()
 
     def load_artists(self):
         """Load artist tags from file."""
@@ -1586,6 +1603,234 @@ class ArtistTagManager:
         else:
             print(f"Warning: Artist tags file not found: {self.tags_file}")
             self.artists = []
+
+    @staticmethod
+    def _normalize_artist_lookup_key(value: str) -> str:
+        """Normalize spacing and underscore variants without fuzzy matching."""
+        return " ".join(value.casefold().replace("_", " ").split())
+
+    def _build_artist_lookup(self):
+        """Build exact and unambiguous normalized lookup tables."""
+        self._artist_set = set(self.artists)
+        self._artist_exact_lookup = {
+            artist.casefold(): artist for artist in self.artists
+        }
+        aliases: Dict[str, str] = {}
+        ambiguous = set()
+
+        for artist in self.artists:
+            key = self._normalize_artist_lookup_key(artist)
+            existing = aliases.get(key)
+            if existing is not None and existing != artist:
+                ambiguous.add(key)
+            else:
+                aliases[key] = artist
+
+        for key in ambiguous:
+            aliases.pop(key, None)
+        self._artist_alias_lookup = aliases
+
+    def _match_artist_segment(self, segment: str) -> Optional[str]:
+        """Resolve one comma/newline-delimited segment to a canonical artist."""
+        raw = segment.strip()
+        if not raw:
+            return None
+
+        variants = []
+
+        def add_variant(value: str):
+            value = value.strip()
+            if value and value not in variants:
+                variants.append(value)
+
+        # Try the literal text first so numeric and punctuated artist names are
+        # never damaged by list-marker or prompt-weight cleanup.
+        add_variant(raw)
+        add_variant(
+            re.sub(r"^\s*(?:[-*•]+|\d+[.)])\s+", "", raw)
+        )
+
+        index = 0
+        while index < len(variants):
+            value = variants[index]
+            index += 1
+
+            if len(value) >= 2 and (value[0], value[-1]) in {
+                ("[", "]"),
+                ("{", "}"),
+                ("(", ")"),
+            }:
+                add_variant(value[1:-1])
+
+            explicit_artist = re.search(
+                r"(?:^|\s)artist\s*:\s*(.+)$",
+                value,
+                flags=re.IGNORECASE,
+            )
+            if explicit_artist:
+                add_variant(explicit_artist.group(1))
+            elif re.match(r"^artist\s+\S", value, flags=re.IGNORECASE):
+                add_variant(re.sub(
+                    r"^artist\s+",
+                    "",
+                    value,
+                    count=1,
+                    flags=re.IGNORECASE,
+                ))
+
+            add_variant(
+                re.sub(r":\s*-?\d+(?:\.\d+)?\s*$", "", value)
+            )
+
+        for value in variants:
+            exact = self._artist_exact_lookup.get(value.casefold())
+            if exact is not None:
+                return exact
+
+            normalized = self._normalize_artist_lookup_key(value)
+            alias = self._artist_alias_lookup.get(normalized)
+            if alias is not None:
+                return alias
+
+        return None
+
+    def extract_artists_from_text(self, text: str) -> Tuple[List[str], int]:
+        """Keep only known artists from comma/newline-delimited pasted text."""
+        segments = [
+            segment.strip()
+            for segment in re.split(r"[,;\n|\t]+", text or "")
+            if segment.strip()
+        ]
+        artists = []
+        seen = set()
+        ignored_count = 0
+
+        for segment in segments:
+            artist = self._match_artist_segment(segment)
+            if artist is None:
+                ignored_count += 1
+                continue
+            if artist not in seen:
+                seen.add(artist)
+                artists.append(artist)
+
+        return artists, ignored_count
+
+    def load_temporary_pool(self):
+        """Restore the separately persisted temporary discovery pool."""
+        if not self.temporary_pool_file.exists():
+            return
+
+        try:
+            with open(self.temporary_pool_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise TypeError("temporary pool data must be an object")
+            artists = data.get("artists", [])
+            if not isinstance(artists, list):
+                raise TypeError("temporary pool artists must be a list")
+            self.temporary_pool = list(dict.fromkeys(
+                artist
+                for artist in artists
+                if artist in self._artist_set
+            ))
+            self.temporary_pool_enabled = bool(data.get("enabled", False))
+            if len(self.temporary_pool) < 2:
+                self.temporary_pool_enabled = False
+        except (OSError, TypeError, json.JSONDecodeError) as exc:
+            print(f"Could not restore temporary pool: {exc}")
+
+    def save_temporary_pool(self):
+        """Persist temporary artists atomically without touching active_pool.json."""
+        data = {
+            "artists": self.temporary_pool,
+            "enabled": self.temporary_pool_enabled,
+        }
+        self.temporary_pool_file.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = self.temporary_pool_file.with_suffix(".tmp")
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            temp_file.replace(self.temporary_pool_file)
+        except OSError as exc:
+            print(f"Could not save temporary pool: {exc}")
+
+    def activate_temporary_pool(self, artists: List[str]):
+        """Start isolated solo comparisons from at least two known artists."""
+        canonical = list(dict.fromkeys(
+            artist for artist in artists if artist in self._artist_set
+        ))
+        if len(canonical) < 2:
+            raise ValueError("임시 풀에는 확인된 작가가 최소 2명 필요합니다.")
+        self.temporary_pool = canonical
+        self.temporary_pool_enabled = True
+        self.save_temporary_pool()
+
+    def deactivate_temporary_pool(self):
+        """Return future comparisons to the active pool while keeping the list."""
+        self.temporary_pool_enabled = False
+        self.save_temporary_pool()
+
+    def get_temporary_pool_text(self) -> str:
+        """Return the canonical, non-artist-free temporary list for the UI."""
+        return "\n".join(self.temporary_pool)
+
+    def get_temporary_pool_stats(self) -> dict:
+        """Summarize temporary artists without changing active-pool statistics."""
+        active_artists = set(
+            self.active_pool.pool if self.active_pool else []
+        )
+        active_count = sum(
+            artist in active_artists for artist in self.temporary_pool
+        )
+        rated_count = sum(
+            artist in self.elo_system.ratings
+            for artist in self.temporary_pool
+        ) if self.elo_system else 0
+        return {
+            "enabled": self.temporary_pool_enabled,
+            "size": len(self.temporary_pool),
+            "already_active": active_count,
+            "outside_active": len(self.temporary_pool) - active_count,
+            "rated": rated_count,
+        }
+
+    def _select_temporary_artist(self, candidates: List[str]) -> str:
+        """Select a temporary artist using the active candidate rule when possible."""
+        if self.active_pool:
+            focused = self.active_pool._get_candidate_rule_candidates(candidates)
+            if (
+                focused
+                and random.random() < CANDIDATE_RULE_FOCUS_PROBABILITY
+            ):
+                return self.active_pool._weighted_choice(
+                    focused,
+                    self.active_pool._get_candidate_rule_weights(focused),
+                )
+
+        weights = [
+            1.0 / (
+                1.0
+                + math.sqrt(
+                    self.elo_system.get_artist_comparison_count(artist)
+                    if self.elo_system
+                    else 0
+                )
+            )
+            for artist in candidates
+        ]
+        return ActivePool._weighted_choice(candidates, weights)
+
+    def _get_temporary_comparison_pair(
+        self,
+    ) -> Tuple[List[str], List[str], str]:
+        """Return two distinct solo artists from the isolated discovery pool."""
+        first = self._select_temporary_artist(self.temporary_pool)
+        remaining = [
+            artist for artist in self.temporary_pool if artist != first
+        ]
+        second = self._select_temporary_artist(remaining)
+        return [first], [second], POOL_ACTION_TEMPORARY
 
     def initialize_pool(self, elo_system: ELOSystem):
         """Initialize the active pool with the ELO system."""
@@ -1605,6 +1850,9 @@ class ArtistTagManager:
 
     def get_comparison_pair(self) -> Tuple[List[str], List[str], str]:
         """Select both sides and record how the pool should process the result."""
+        if self.temporary_pool_enabled and len(self.temporary_pool) >= 2:
+            return self._get_temporary_comparison_pair()
+
         if self.active_pool:
             return self.active_pool.select_comparison_pair()
 
@@ -1623,6 +1871,8 @@ class ArtistTagManager:
         pool_action: str = POOL_ACTION_STANDARD,
     ) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float, bool]]]:
         """Process comparison result to update the active pool. Returns (rotated_out, rotated_in)."""
+        if pool_action == POOL_ACTION_TEMPORARY:
+            return [], []
         if self.active_pool:
             return self.active_pool.process_result(winners, losers, pool_action)
         return [], []
@@ -2002,6 +2252,8 @@ class UndoState:
     losers: List[str]
     old_ratings: dict  # artist -> old rating
     old_comparisons: dict  # artist -> old comparison count
+    old_rating_presence: dict  # artist -> whether rating existed before vote
+    old_comparison_presence: dict  # artist -> whether count existed before vote
     rotated_out: List[str]  # artists that were rotated out of pool
     rotated_in: List[str]  # artists that were added to the pool
     # Previous comparison images (for restoring on undo)
@@ -2174,11 +2426,41 @@ class ArtistELORanker:
         candidate_rule = get_candidate_rule_label(
             self.artist_manager.get_candidate_rule()
         )
+        temporary = self.artist_manager.get_temporary_pool_stats()
+        if temporary["enabled"]:
+            return (
+                f"**임시 풀 {temporary['size']}명 탐색 중** · "
+                f"활성 풀 {stats.get('size', 0)}명 보존 · "
+                f"풀 아웃 {stats.get('out_count', 0)}명 · "
+                f"**{candidate_rule}**"
+            )
         return (
             f"**활성 풀 {stats.get('size', 0)}명** · "
             f"풀 아웃 {stats.get('out_count', 0)}명 · "
             f"전체 {stats.get('total_artists', 0)}명 · "
             f"**{mode} / {candidate_rule}**"
+        )
+
+    def format_temporary_pool_status(self) -> str:
+        """Explain whether future comparisons use the isolated temporary pool."""
+        stats = self.artist_manager.get_temporary_pool_stats()
+        if stats["enabled"]:
+            return (
+                f"**임시 풀 탐색 중 · {stats['size']}명**  \n"
+                f"활성 풀에 이미 있는 작가 {stats['already_active']}명 · "
+                f"활성 풀 밖 작가 {stats['outside_active']}명 · "
+                f"평가 이력 보유 {stats['rated']}명  \n"
+                "다음 비교부터 한 명 대 한 명으로 평가합니다. "
+                "ELO와 기록은 저장되지만 활성 풀은 변경되지 않습니다."
+            )
+        if stats["size"]:
+            return (
+                f"임시 풀은 정지되어 있습니다. 정리된 {stats['size']}명 목록은 "
+                "보존되어 있으며 다시 시작할 수 있습니다."
+            )
+        return (
+            "쉼표 또는 줄바꿈으로 구분된 목록이나 프롬프트를 붙여넣으세요. "
+            "등록된 작가명만 남기고 나머지 텍스트는 제거합니다."
         )
 
     def save_prompt_preset(
@@ -2336,6 +2618,11 @@ class ArtistELORanker:
         lines.append(
             f"**후보 규칙:** {get_candidate_rule_label(self.artist_manager.get_candidate_rule())}"
         )
+        temporary = self.artist_manager.get_temporary_pool_stats()
+        if temporary["enabled"]:
+            lines.append(
+                f"**임시 풀:** {temporary['size']}명 단독 탐색 중 · 활성 풀 변경 없음"
+            )
 
         # Pool health breakdown
         lines.append("")
@@ -2565,6 +2852,13 @@ class ArtistELORanker:
         # Save state for undo BEFORE making changes
         old_ratings = {a: self.elo_system.get_rating(a) for a in winners + losers}
         old_comparisons = {a: self.elo_system.get_artist_comparison_count(a) for a in winners + losers}
+        old_rating_presence = {
+            a: a in self.elo_system.ratings for a in winners + losers
+        }
+        old_comparison_presence = {
+            a: a in self.elo_system.artist_comparisons
+            for a in winners + losers
+        }
 
         # Update ELO ratings
         self.elo_system.update_ratings(winners, losers)
@@ -2594,6 +2888,8 @@ class ArtistELORanker:
             losers=losers.copy(),
             old_ratings=old_ratings,
             old_comparisons=old_comparisons,
+            old_rating_presence=old_rating_presence,
+            old_comparison_presence=old_comparison_presence,
             rotated_out=rotated_out_names,
             rotated_in=rotated_in_names,
             prev_image_a=str(self.current_image_a) if self.current_image_a else None,
@@ -2662,11 +2958,17 @@ class ArtistELORanker:
 
         # Restore old ratings
         for artist, old_rating in state.old_ratings.items():
-            self.elo_system.ratings[artist] = old_rating
+            if state.old_rating_presence.get(artist, True):
+                self.elo_system.ratings[artist] = old_rating
+            else:
+                self.elo_system.ratings.pop(artist, None)
 
         # Restore old comparison counts
         for artist, old_count in state.old_comparisons.items():
-            self.elo_system.artist_comparisons[artist] = old_count
+            if state.old_comparison_presence.get(artist, True):
+                self.elo_system.artist_comparisons[artist] = old_count
+            else:
+                self.elo_system.artist_comparisons.pop(artist, None)
 
         # Decrement total comparison count
         self.elo_system.comparison_count -= 1
@@ -2769,6 +3071,34 @@ class ArtistELORanker:
                         )
                         + " 풀 증감이 필요한 신규·교체 라운드는 기존 운영 규칙이 우선합니다."
                     )
+
+                    with gr.Accordion("임시 작가 탐색", open=False):
+                        gr.Markdown(
+                            "붙여넣은 텍스트에서 등록된 작가명만 추출해 "
+                            "기존 활성 풀과 분리된 단독 비교 풀을 만듭니다."
+                        )
+                        temporary_pool_input = gr.Textbox(
+                            label="작가 목록 또는 프롬프트",
+                            value=self.artist_manager.get_temporary_pool_text(),
+                            placeholder=(
+                                "artist: example one, quality tags\n"
+                                "example two\n"
+                                "작가명이 아닌 내용은 자동으로 제거됩니다."
+                            ),
+                            lines=6,
+                        )
+                        with gr.Row():
+                            temporary_pool_start_btn = gr.Button(
+                                "🔎 추출하고 시작",
+                                variant="primary",
+                            )
+                            temporary_pool_stop_btn = gr.Button(
+                                "임시 풀 종료",
+                                variant="secondary",
+                            )
+                        temporary_pool_status = gr.Markdown(
+                            self.format_temporary_pool_status()
+                        )
 
                     with gr.Accordion("Image Settings", open=False):
                         with gr.Column(elem_id="nai-settings-panel"):
@@ -3231,6 +3561,51 @@ class ArtistELORanker:
                     self.format_pool_badge(),
                 )
 
+            def on_temporary_pool_start(text):
+                """Extract known artists and activate isolated future comparisons."""
+                artists, ignored_count = (
+                    self.artist_manager.extract_artists_from_text(text)
+                )
+                cleaned_text = "\n".join(artists)
+                if len(artists) < 2:
+                    return (
+                        cleaned_text,
+                        f"**시작할 수 없습니다.** 확인된 작가 {len(artists)}명 · "
+                        f"제거한 비작가 항목 {ignored_count}개. 최소 2명이 필요합니다.",
+                        self.format_pool_badge(),
+                        self.format_top_artists_display(),
+                    )
+
+                try:
+                    self.artist_manager.activate_temporary_pool(artists)
+                except ValueError as exc:
+                    return (
+                        cleaned_text,
+                        f"**시작할 수 없습니다.** {exc}",
+                        self.format_pool_badge(),
+                        self.format_top_artists_display(),
+                    )
+
+                return (
+                    cleaned_text,
+                    f"확인된 작가 {len(artists)}명 · "
+                    f"제거한 비작가 항목 {ignored_count}개  \n"
+                    + self.format_temporary_pool_status()
+                    + "  \n현재 비교 화면은 유지되며 다음 비교부터 적용됩니다.",
+                    self.format_pool_badge(),
+                    self.format_top_artists_display(),
+                )
+
+            def on_temporary_pool_stop():
+                """Stop temporary selection without clearing its list or current pair."""
+                self.artist_manager.deactivate_temporary_pool()
+                return (
+                    self.format_temporary_pool_status()
+                    + " 현재 비교 화면은 유지되며 다음 비교부터 기존 풀로 돌아갑니다.",
+                    self.format_pool_badge(),
+                    self.format_top_artists_display(),
+                )
+
             def on_resolution_change(resolution_key):
                 settings = GenerationSettings.from_values(
                     resolution_key,
@@ -3372,6 +3747,22 @@ class ArtistELORanker:
                 fn=on_candidate_rule_change,
                 inputs=[candidate_rule_dropdown],
                 outputs=[candidate_rule_help, leaderboard, pool_badge],
+            )
+
+            temporary_pool_start_btn.click(
+                fn=on_temporary_pool_start,
+                inputs=[temporary_pool_input],
+                outputs=[
+                    temporary_pool_input,
+                    temporary_pool_status,
+                    pool_badge,
+                    leaderboard,
+                ],
+            )
+
+            temporary_pool_stop_btn.click(
+                fn=on_temporary_pool_stop,
+                outputs=[temporary_pool_status, pool_badge, leaderboard],
             )
 
             resolution_dropdown.change(
