@@ -2141,7 +2141,20 @@ class DeathmatchPool:
         self.main_pool = main_pool
         self.pool_file = pool_file or DEATHMATCH_POOL_FILE
         self.artists: List[str] = []
+        first_run = not self.pool_file.exists()
         self.load()
+        if first_run:
+            # Before the deathmatch feature existed, broken-heart artists were
+            # stored only as manual exclusions. Migrate them exactly once; an
+            # empty saved deathmatch file prevents confirmed DOWN artists from
+            # being re-queued on later restarts.
+            self.artists = [
+                artist
+                for artist in self.all_artists
+                if artist in self.main_pool.manual_excluded
+                and artist not in self.main_pool.hall_of_fame
+            ]
+            self.save()
         self.main_pool.set_deathmatch(self.artists)
 
     def load(self):
