@@ -8,10 +8,12 @@ from unittest.mock import AsyncMock, Mock, patch
 from artist_elo_ranker import (
     ActivePool,
     ArtistELORanker,
+    ArtistTagManager,
     CANDIDATE_RULE_DARK_HORSE,
     CANDIDATE_RULE_FAMILIAR,
     CANDIDATE_RULE_NEW,
     CANDIDATE_RULE_PROVEN,
+    ComparisonHistory,
     ELOSystem,
     GenerationSettings,
     PromptPresetStore,
@@ -20,6 +22,7 @@ from artist_elo_ranker import (
     POOL_ACTION_REFILL_FROM_150,
     POOL_ACTION_TRIM_FROM_200,
     POOL_ACTION_TRIM_TO_150,
+    POOL_ACTION_TEMPORARY,
     RANKING_MODE_FAST_ROTATION,
     RANKING_MODE_NEWCOMERS,
     RANKING_MODE_TOP,
@@ -157,6 +160,154 @@ class RankingModeTests(unittest.TestCase):
         stats = pool.get_pool_stats()
 
         self.assertEqual(stats["out_count"], 1)
+
+    def test_artist_text_extraction_removes_non_artists_and_duplicates(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        tags_file = Path(temp_dir.name) / "artists.txt"
+        tags_file.write_text(
+            "alpha artist\n723_nanahumi\nlococo:p\nbeta (test)\n",
+            encoding="utf-8",
+        )
+        manager = ArtistTagManager(
+            tags_file,
+            ELOSystem(),
+            Path(temp_dir.name) / "temporary_pool.json",
+        )
+
+        artists, ignored_count = manager.extract_artists_from_text(
+            "quality, artist: alpha_artist, {artist: lococo:p:1.2}, "
+            "- 723 nanahumi, alpha artist, bad anatomy"
+        )
+
+        self.assertEqual(
+            artists,
+            ["alpha artist", "lococo:p", "723_nanahumi"],
+        )
+        self.assertEqual(ignored_count, 2)
+
+    def test_temporary_pool_persists_and_can_be_stopped_without_clearing(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        tags_file = Path(temp_dir.name) / "artists.txt"
+        tags_file.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+        temporary_pool_file = Path(temp_dir.name) / "temporary_pool.json"
+
+        manager = ArtistTagManager(
+            tags_file,
+            ELOSystem(),
+            temporary_pool_file,
+        )
+        manager.activate_temporary_pool(["alpha", "beta", "gamma"])
+
+        reloaded = ArtistTagManager(
+            tags_file,
+            ELOSystem(),
+            temporary_pool_file,
+        )
+        self.assertTrue(reloaded.temporary_pool_enabled)
+        self.assertEqual(reloaded.temporary_pool, ["alpha", "beta", "gamma"])
+
+        reloaded.deactivate_temporary_pool()
+        stopped = ArtistTagManager(
+            tags_file,
+            ELOSystem(),
+            temporary_pool_file,
+        )
+        self.assertFalse(stopped.temporary_pool_enabled)
+        self.assertEqual(stopped.temporary_pool, ["alpha", "beta", "gamma"])
+
+    def test_temporary_comparison_is_solo_and_never_mutates_active_pool(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        artists = ["active_a", "active_b", "temp_a", "temp_b", "temp_c"]
+        tags_file = Path(temp_dir.name) / "artists.txt"
+        tags_file.write_text("\n".join(artists) + "\n", encoding="utf-8")
+        elo = ELOSystem()
+        manager = ArtistTagManager(
+            tags_file,
+            elo,
+            Path(temp_dir.name) / "temporary_pool.json",
+        )
+        manager.active_pool = ActivePool(
+            artists,
+            elo,
+            pool_size=2,
+            pool_file=Path(temp_dir.name) / "active_pool.json",
+        )
+        manager.active_pool.pool = ["active_a", "active_b"]
+        manager.active_pool.save()
+        manager.activate_temporary_pool(["temp_a", "temp_b", "temp_c"])
+        original_pool = manager.active_pool.pool.copy()
+
+        artists_a, artists_b, action = manager.get_comparison_pair()
+        rotated_out, rotated_in = manager.process_result(
+            artists_a,
+            artists_b,
+            action,
+        )
+
+        self.assertEqual(action, POOL_ACTION_TEMPORARY)
+        self.assertEqual(len(artists_a), 1)
+        self.assertEqual(len(artists_b), 1)
+        self.assertNotEqual(artists_a, artists_b)
+        self.assertTrue(set(artists_a + artists_b) <= set(manager.temporary_pool))
+        self.assertEqual(rotated_out, [])
+        self.assertEqual(rotated_in, [])
+        self.assertEqual(manager.active_pool.pool, original_pool)
+
+    def test_undo_first_temporary_vote_removes_new_rating_entries(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        artists = ["active_a", "active_b", "temp_a", "temp_b"]
+        tags_file = Path(temp_dir.name) / "artists.txt"
+        tags_file.write_text("\n".join(artists) + "\n", encoding="utf-8")
+        elo = ELOSystem()
+        manager = ArtistTagManager(
+            tags_file,
+            elo,
+            Path(temp_dir.name) / "temporary_pool.json",
+        )
+        manager.active_pool = ActivePool(
+            artists,
+            elo,
+            pool_size=2,
+            pool_file=Path(temp_dir.name) / "active_pool.json",
+        )
+        manager.active_pool.pool = ["active_a", "active_b"]
+        manager.active_pool.save()
+
+        ranker = ArtistELORanker.__new__(ArtistELORanker)
+        ranker.elo_system = elo
+        ranker.artist_manager = manager
+        ranker.history = ComparisonHistory(
+            Path(temp_dir.name) / "comparison_history.json"
+        )
+        ranker.current_image_a = None
+        ranker.current_image_b = None
+        ranker.current_artists_a = ["temp_a"]
+        ranker.current_artists_b = ["temp_b"]
+        ranker.current_pool_action = POOL_ACTION_TEMPORARY
+        ranker.current_generation_settings = GenerationSettings()
+        ranker.current_quality_toggle = True
+        ranker.current_uc_preset = 0
+        ranker.current_pair_seed = 123
+        ranker.rotation_log = []
+        ranker.last_undo_state = None
+        ranker.selection_made = False
+
+        with patch.object(ELOSystem, "save"):
+            ranker.pick_winner("A")
+            self.assertIn("temp_a", elo.ratings)
+            self.assertIn("temp_b", elo.ratings)
+            ranker.undo_last_selection()
+
+        self.assertNotIn("temp_a", elo.ratings)
+        self.assertNotIn("temp_b", elo.ratings)
+        self.assertNotIn("temp_a", elo.artist_comparisons)
+        self.assertNotIn("temp_b", elo.artist_comparisons)
+        self.assertEqual(manager.active_pool.pool, ["active_a", "active_b"])
+        self.assertEqual(ranker.history.records, [])
 
     def test_new_mode_below_200_selects_two_outside_artists_as_solos(self):
         active = [f"active_{index}" for index in range(150)]
